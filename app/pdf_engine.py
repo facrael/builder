@@ -1,6 +1,7 @@
 import pymupdf
 import re
 import os
+import base64
 from pathlib import Path
 
 MM_TO_PT = 72.0 / 25.4  # 1 мм ≈ 2.8346 pt
@@ -75,7 +76,7 @@ def extract_pdf_context(pdf_path: str, query: str, max_pages: int = 3) -> str:
     return "\n\n".join(context_chunks) if context_chunks else "Текстовый слой на релевантных листах пуст или сканирован без распознавания."
 
 
-def parse_filename_meta(filename: str = "") -> dict:
+def parse_filename_meta(filename: str) -> dict:
     """
     Интеллектуальный разбор метаданных из названия файла:
     Например: 'Э1075 ДСП ЦТП КМ10 Площадки и опоры.pdf'
@@ -86,7 +87,7 @@ def parse_filename_meta(filename: str = "") -> dict:
 
     # 1. Гриф секретности / конфиденциальности
     sec_level = "L0"
-    if re.search(r'\b(ДСП|КТ|СЕКРЕТ|ТАЙН|СМЕТ|КОММЕРЧ)\b', clean_name, re.IGNORECASE):
+    if re.search(r'(?:ДСП|КТ|СЕКРЕТ|ТАЙН|СМЕТ|КОММЕРЧ)', clean_name, re.IGNORECASE):
         sec_level = "L1"
 
     # 2. Раздел проекта
@@ -103,10 +104,11 @@ def parse_filename_meta(filename: str = "") -> dict:
             break
     if not obj_candidate:
         for token in tokens:
-            if token.upper() in ("ДСП", "РД", "П", "ГИП", "ПТО", "ЛИСТ", "ИЗМ", "ИЗМ1", "ИЗМ2", "ИЗМ3", "ОПОРЫ", "ПЛОЩАДКИ"):
+            clean_tok = re.sub(r'(?:ДСП|КТ|РД|П)$', '', token, flags=re.I).upper()
+            if clean_tok in ("ДСП", "РД", "П", "ГИП", "ПТО", "ЛИСТ", "ИЗМ", "ИЗМ1", "ИЗМ2", "ИЗМ3", "ОПОРЫ", "ПЛОЩАДКИ", ""):
                 continue
-            if re.search(r'^(ЖК|КОРПУС|БЛОК|СКЛАД|КОТЕЛЬНАЯ|[А-ЯA-Z]\d{3,})', token, re.IGNORECASE):
-                obj_candidate = token.upper()
+            if re.search(r'^(ЖК|КОРПУС|БЛОК|СКЛАД|КОТЕЛЬНАЯ|[А-ЯA-Z]\d{3,})', clean_tok, re.IGNORECASE):
+                obj_candidate = clean_tok
                 break
 
     # 4. Формирование внятного шифра документа
@@ -123,13 +125,6 @@ def parse_filename_meta(filename: str = "") -> dict:
         detected_code = "-".join(id_tokens[:3])
     else:
         detected_code = clean_name[:40]
-
-    return {
-        "sec_level": sec_level,
-        "section": detected_section,
-        "code": detected_code,
-        "project_code": obj_candidate
-    }
 
     return {
         "sec_level": sec_level,
@@ -312,6 +307,109 @@ def locate_drawing_fragments(
 
     doc.close()
     return locations
+
+
+def render_full_sheet(
+    pdf_path: str,
+    page_index: int,
+    user_fullname: str,
+    doc_meta: str,
+    dpi: int = 200
+) -> str:
+    """
+    Рендерит весь лист чертежа целиком в высоком разрешении с наложением водяного знака.
+    Используется, когда нужен чертеж целиком или на скане нет координат отдельного узла.
+    """
+    doc = pymupdf.open(pdf_path)
+    page = doc[page_index]
+    
+    # Создаем копию страницы для нанесения водяного знака
+    temp_doc = pymupdf.open()
+    temp_page = temp_doc.new_page(width=page.rect.width, height=page.rect.height)
+    temp_page.show_pdf_page(temp_page.rect, doc, page_index)
+
+    watermark_text = (
+        f"АКТУАЛЬНО | {doc_meta} | Лист {page_index + 1}\n"
+        f"Выдано: {user_fullname} | ПРОВЕРЬ ПО ЛИСТУ-ИСТОЧНИКУ"
+    )
+    _insert_cyrillic_textbox(
+        temp_page,
+        pymupdf.Rect(20, 15, page.rect.width - 20, 60),
+        watermark_text,
+        fontsize=10,
+        color=(0.8, 0.1, 0.1),
+    )
+
+    out_path = f"{pdf_path}_sheet_{page_index + 1}.png"
+    pix = temp_page.get_pixmap(dpi=dpi)
+    pix.save(out_path)
+
+    temp_doc.close()
+    doc.close()
+    return out_path
+
+
+def get_multimodal_context_pages(pdf_path: str, query: str = "", max_pages: int = 3, dpi: int = 120) -> list[dict]:
+    """
+    Готовит страницы чертежа для мультимодальных Vision-моделей (Claude 3.5 Sonnet / GPT-4o).
+    Конвертирует листы в base64 PNG, чтобы нейросеть могла 'глазами' прочесть размеры со сканов.
+    Для сканов автоматически выбирает альбомные листы (Landscape) с чертежами и схемами.
+    """
+    if not os.path.exists(pdf_path):
+        return []
+
+    doc = pymupdf.open(pdf_path)
+    total_pages = len(doc)
+    
+    tokens = [w.lower()[:4] for w in re.findall(r'[а-яa-z0-9]{4,}', query, re.I)]
+    
+    # 1. Проверяем, есть ли текст
+    scored = []
+    landscape_indices = []
+    for p_idx in range(total_pages):
+        page = doc[p_idx]
+        if page.rect.width > page.rect.height:
+            landscape_indices.append(p_idx)
+            
+        txt = page.get_text("text")
+        s = sum(len(re.findall(t, txt, re.I)) for t in tokens)
+        scored.append((p_idx, s))
+    
+    scored.sort(key=lambda x: x[1], reverse=True)
+    
+    # Если найдены совпадения по тексту
+    if scored and scored[0][1] > 0:
+        selected_indices = [x[0] for x in scored[:max_pages]]
+    else:
+        # Для сканов (текстовый слой пуст):
+        # Чертежи и схемы в строительных альбомах ВСЕГДА выполняются на альбомных листах (Landscape)!
+        selected_indices = []
+        if landscape_indices:
+            # Если запрос про опалубку/схему/план — берем альбомные чертежи
+            selected_indices.extend(landscape_indices[:2])
+            # И добавляем лист с общими указаниями/составом (обычно лист 3 или лист перед чертежами)
+            if total_pages >= 3 and 2 not in selected_indices:
+                selected_indices.append(2)
+        else:
+            # Fallback
+            selected_indices = list(range(min(max_pages, total_pages)))
+
+    # Сортируем листы по порядку следования
+    selected_indices = sorted(list(set(selected_indices))[:max_pages])
+
+    results = []
+    for p_idx in selected_indices:
+        page = doc[p_idx]
+        pix = page.get_pixmap(dpi=dpi)
+        b64_str = base64.b64encode(pix.tobytes("png")).decode("utf-8")
+        results.append({
+            "sheet_index": p_idx,
+            "sheet_number": p_idx + 1,
+            "base64": b64_str
+        })
+
+    doc.close()
+    return results
 
 
 def render_drawing_fragment(

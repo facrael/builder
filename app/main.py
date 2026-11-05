@@ -1,7 +1,6 @@
 import asyncio
 import hashlib
 import os
-import re
 import httpx
 from pathlib import Path
 from aiogram import Bot, Dispatcher, F
@@ -15,7 +14,9 @@ from pdf_engine import (
     crop_drawing_fragment,
     locate_drawing_fragments,
     render_drawing_fragment,
-    extract_pdf_context
+    extract_pdf_context,
+    render_full_sheet,
+    get_multimodal_context_pages
 )
 from obsidian import sync_document_card
 
@@ -216,10 +217,16 @@ async def handle_file_upload(message: Message):
 
     sha256_hash = hashlib.sha256(local_path.read_bytes()).hexdigest()
 
-    # Разбор объекта из подписи к сообщению (например, 'добавь в папку цтп' или 'в цтп')
+    # Разбор объекта и раздела из подписи к сообщению (например, 'добавь в папку цтп кж' или 'в цтп')
     caption_text = (message.caption or "").strip()
     detected_project = None
+    detected_sec_cap = None
     if caption_text:
+        # Поиск раздела: КЖ, КМ, АР, КР и т.д.
+        m_sec = re.search(r'\b(КР|АР|КМ|КЖ|ОВ|ВК|ЭОМ|ЭО|ЭМ|АТХ|ГП|ТХ|АС|ПЗ|ПОС|ППР)\d*\b', caption_text, re.IGNORECASE)
+        if m_sec:
+            detected_sec_cap = m_sec.group(1).upper()
+
         # Прямой поиск строительных аббревиатур: ЦТП, КНС, ИТП, ТП, РП
         m_abbr = re.search(r'\b(ЦТП|КНС|ИТП|ТП|РП|БКТП|ГРЩ|[А-ЯA-Z]\d{3,})\b', caption_text, re.IGNORECASE)
         if m_abbr:
@@ -236,7 +243,7 @@ async def handle_file_upload(message: Message):
     if local_path.suffix.lower() == ".pdf":
         stamp = extract_gost_stamp_info(str(local_path), filename=doc_file.file_name)
         code = stamp["detected_code"]
-        section = stamp["detected_section"]
+        section = detected_sec_cap or stamp["detected_section"]
         sec_level = stamp["suggested_sec_level"]
         project_code = detected_project or stamp["suggested_project"] or "ОБЪЕКТ-1"
         doc_type = "РД"
@@ -312,17 +319,8 @@ async def confirm_upload(call: CallbackQuery):
         sec_level=meta.sec_level,
         file_path=meta.file_path,
         sha256=meta.sha256,
-        user_id=user["id"],
+        user_id=user["id"]
     )
-    if saved_doc.get("duplicate"):
-        await call.message.answer(
-            f"⚠️ Этот файл уже зарегистрирован в реестре.\n"
-            f"Шифр: `{saved_doc['code']}` | Ревизия: {saved_doc['revision']} | "
-            f"Статус: {saved_doc['status']} | Проект: `{saved_doc['project_code']}`.\n"
-            f"Новая запись не создана — загрузите другой файл, если это новая ревизия."
-        )
-        await call.answer()
-        return
 
     # Генерируем карточку в Obsidian
     obsidian_path = sync_document_card(saved_doc)
@@ -346,10 +344,10 @@ async def cancel_upload(call: CallbackQuery):
     else:
         await call.message.edit_text("❌ Загрузка документа отменена пользователем.")
 
-async def query_llm(system_prompt: str, user_prompt: str) -> str:
+async def query_llm(system_prompt: str, user_prompt: str, image_base64_list: list[str] = None) -> str:
     """
     Универсальный вызов LLM:
-    - OpenRouter (Claude 3.5 Sonnet, GPT-4o, DeepSeek, Gemini, Llama 3)
+    - OpenRouter (Claude 3.5 Sonnet, GPT-4o, DeepSeek, Gemini) с поддержкой Vision (сканы чертежей)
     - Локальный Hermes / vLLM / Ollama
     """
     use_openrouter = (LLM_PROVIDER == "openrouter") or bool(OPENROUTER_API_KEY)
@@ -364,11 +362,25 @@ async def query_llm(system_prompt: str, user_prompt: str) -> str:
             "X-Title": "Construction Registry Bot",
             "Content-Type": "application/json"
         }
+
+        # Если переданы сканы чертежей, формируем мультимодальный Vision payload
+        if image_base64_list:
+            user_content = [{"type": "text", "text": user_prompt}]
+            for b64 in image_base64_list:
+                user_content.append({
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:image/png;base64,{b64}"
+                    }
+                })
+        else:
+            user_content = user_prompt
+
         payload = {
             "model": OPENROUTER_MODEL,
             "messages": [
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
+                {"role": "user", "content": user_content}
             ],
             "temperature": 0.1
         }
@@ -397,8 +409,8 @@ async def cmd_ask_hermes(message: Message):
     Интеллектуальный мост к LLM (OpenRouter или локальный Hermes):
     1. Находит актуальный документ пользователя.
     2. Извлекает реальное содержимое чертежей и спецификаций (RAG).
-    3. При запросе схем/узлов находит и вырезает графический фрагмент с водяным знаком.
-    4. Передает контекст листов в LLM для формулирования инженерного ответа.
+    3. При сканах подключает Vision-модель (Claude 3.5 Sonnet читает сканы глазами).
+    4. При запросе схем/узлов отправляет фото чертежа с водяным знаком в Telegram.
     """
     user = await db.get_user(message.from_user.id)
     if not user:
@@ -409,6 +421,8 @@ async def cmd_ask_hermes(message: Message):
         return
 
     doc = await db.find_active_doc_with_acl(user, doc_type="РД")
+    vision_images = []
+    
     if doc:
         sec_level = doc.get("security_level", "L0")
         if sec_level in ("L1", "L2"):
@@ -423,17 +437,35 @@ async def cmd_ask_hermes(message: Message):
             # Извлекаем реальный контекст листов из PDF (RAG)
             pdf_path = doc["file_path"]
             pdf_content = extract_pdf_context(pdf_path, question, max_pages=3)
-            context_info = (
-                f"Актуальный документ: Шифр '{doc['code']}', Раздел '{doc['section']}', "
-                f"Изм. {doc['revision']}, Статус: АКТУАЛЕН (Гриф L0).\n\n"
-                f"=== ДАННЫЕ ИЗ ЛИСТОВ ЧЕРТЕЖА ===\n{pdf_content}"
-            )
+            
+            # Проверяем, скан ли это (пустой или почти пустой текстовый слой)
+            is_scanned_pdf = ("пуст или сканирован" in pdf_content) or (len(pdf_content.strip()) < 150)
+            
+            if is_scanned_pdf and os.path.exists(pdf_path):
+                # Подключаем Vision: рендерим страницы чертежа в base64 для Claude/GPT
+                pages_meta = get_multimodal_context_pages(pdf_path, query=question, max_pages=2)
+                vision_images = [p["base64"] for p in pages_meta]
+                sheet_nums = [p["sheet_number"] for p in pages_meta]
+                context_info = (
+                    f"Актуальный документ: Шифр '{doc['code']}', Раздел '{doc['section']}', "
+                    f"Изм. {doc['revision']}, Статус: АКТУАЛЕН (Гриф L0).\n"
+                    f"ВНИМАНИЕ: Документ является графическим чертежом/сканом. К запросу прикреплены изображения листов {sheet_nums}.\n"
+                    f"Внимательно изучи прикрепленные сканы чертежей своими глазами (Vision): найди штамп, название чертежа, отметки, размеры, спецификации и ответь на вопрос инженера."
+                )
+            else:
+                context_info = (
+                    f"Актуальный документ: Шифр '{doc['code']}', Раздел '{doc['section']}', "
+                    f"Изм. {doc['revision']}, Статус: АКТУАЛЕН (Гриф L0).\n\n"
+                    f"=== ДАННЫЕ ИЗ ЛИСТОВ ЧЕРТЕЖА ===\n{pdf_content}"
+                )
 
-            # Если пользователь просит графику (схему, узел, разрез, опалубку), пытаемся вырезать фрагмент
+            # Если пользователь просит графику (схему, узел, разрез, опалубку), отправляем чертеж
             graphical_keywords = ["схем", "чертеж", "план", "узел", "разрез", "опалубк", "фасад", "сечен"]
             if any(kw in question.lower() for kw in graphical_keywords) and os.path.exists(pdf_path):
-                # Ищем термины запроса в чертеже
                 search_terms = [w.lower() for w in re.findall(r'[а-яa-z0-9]{4,}', question, re.I)]
+                sent_photo = False
+                
+                # 1. Пробуем вырезать отдельный узел
                 for term in search_terms:
                     locs = locate_drawing_fragments(pdf_path, term, max_results=1)
                     if locs:
@@ -454,7 +486,34 @@ async def cmd_ask_hermes(message: Message):
                                     f"⚠️ *Сверяйте отметки и узлы по полному листу РД.*"
                                 )
                             )
-                        break
+                            sent_photo = True
+                            break
+                
+                # 2. Если точные координаты не найдены (скан) — отправляем альбомный лист чертежа целиком!
+                if not sent_photo:
+                    doc_obj = pymupdf.open(pdf_path)
+                    # В строительных альбомах чертежи и схемы всегда на альбомных листах (Landscape)
+                    landscape_sheets = [i for i, p in enumerate(doc_obj) if p.rect.width > p.rect.height]
+                    if landscape_sheets:
+                        target_p = landscape_sheets[0]  # Первый лист со схемой чертежа (например, Лист 8: Опалубка)
+                    else:
+                        target_p = 2 if len(doc_obj) >= 3 else 0
+                    doc_obj.close()
+
+                    full_sheet = render_full_sheet(
+                        pdf_path=pdf_path,
+                        page_index=target_p,
+                        user_fullname=user["full_name"],
+                        doc_meta=f"{doc['code']} Изм.{doc['revision']}"
+                    )
+                    if os.path.exists(full_sheet):
+                        await message.answer_photo(
+                            FSInputFile(full_sheet),
+                            caption=(
+                                f"📐 Чертеж из актуального комплекта `{doc['code']}` (Лист {target_p + 1}, Изм. {doc['revision']})\n"
+                                f"⚠️ *Сверяйте отметки и узлы по полному листу РД.*"
+                            )
+                        )
     else:
         context_info = "Доступных актуальных документов для текущего пользователя в реестре не найдено."
 
@@ -470,7 +529,8 @@ async def cmd_ask_hermes(message: Message):
     try:
         answer = await query_llm(
             system_prompt=f"{system_prompt}\nКонтекст реестра: {context_info}",
-            user_prompt=question
+            user_prompt=question,
+            image_base64_list=vision_images
         )
     except Exception as e:
         provider_name = f"OpenRouter [{OPENROUTER_MODEL}]" if (LLM_PROVIDER == "openrouter" or OPENROUTER_API_KEY) else f"Локальный Hermes [{HERMES_API_URL}]"
