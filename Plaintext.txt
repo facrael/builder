@@ -1,0 +1,14 @@
+construction-ai/
+├── docker-compose.yml
+├── .env.example
+├── init.sql
+├── storage/
+│   ├── files/          # Оригиналы PDF/Excel
+│   └── obsidian_vault/ # Папка, которую ты откроешь в Obsidian
+└── app/
+    ├── Dockerfile
+    ├── requirements.txt
+    ├── main.py         # Telegram-бот + роутер прав + мост к Hermes
+    ├── db.py           # Запросы к Postgres + Аудит
+    ├── pdf_engine.py   # Вырезка штампа ГОСТ, поиск узлов, водяные знаки
+    └── obsidian.py     # Генерация Markdown-карточек

@@ -1,0 +1,7 @@
+.env
+__pycache__/
+*.pyc
+storage/files/*.pdf
+storage/files/*_stamp.png
+storage/obsidian_vault/_registry/*.md
+kns.pdf
