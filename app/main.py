@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import json
 import os
 import re
 import httpx
@@ -14,8 +15,6 @@ from db import Database, PendingUpload
 from pdf_engine import (
     extract_gost_stamp_info,
     crop_drawing_fragment,
-    locate_drawing_fragments,
-    render_drawing_fragment,
     extract_pdf_context,
     render_full_sheet,
     get_multimodal_context_pages
