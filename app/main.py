@@ -319,8 +319,17 @@ async def confirm_upload(call: CallbackQuery):
         sec_level=meta.sec_level,
         file_path=meta.file_path,
         sha256=meta.sha256,
-        user_id=user["id"]
+        user_id=user["id"],
     )
+    if isinstance(saved_doc, dict) and saved_doc.get("duplicate"):
+        await call.message.answer(
+            f"⚠️ Этот файл уже зарегистрирован в реестре.\n"
+            f"Шифр: `{saved_doc['code']}` | Ревизия: {saved_doc['revision']} | "
+            f"Статус: {saved_doc['status']} | Проект: `{saved_doc['project_code']}`.\n"
+            f"Новая запись не создана — загрузите другой файл, если это новая ревизия."
+        )
+        await call.answer()
+        return
 
     # Генерируем карточку в Obsidian
     obsidian_path = sync_document_card(saved_doc)
@@ -540,6 +549,13 @@ async def cmd_ask_hermes(message: Message):
         )
 
     await message.answer(answer)
+
+# Catch-all: любой свободный текст (не команда, не документ) — как вопрос в LLM.
+# Регистрируется последним, поэтому команды и документы обрабатываются раньше.
+@dp.message(F.text, ~F.text.startswith("/"))
+async def catch_all_question(message: Message):
+    await cmd_ask_hermes(message)
+
 
 async def main():
     await db.connect()

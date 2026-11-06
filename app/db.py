@@ -161,6 +161,17 @@ class Database:
         не может существовать двух 'active' версий одного шифра.
         """
         async with self.pool.acquire() as conn:
+            # Тот же файл уже в реестре (уникальный sha256)? Не падаем по unique constraint.
+            dup = await conn.fetchrow("""
+                SELECT d.*, p.code AS project_code FROM documents d
+                JOIN projects p ON p.id = d.project_id
+                WHERE d.sha256 = $1
+            """, sha256)
+            if dup:
+                res = dict(dup)
+                res["duplicate"] = True
+                return res
+
             async with conn.transaction():
                 proj = await conn.fetchrow("SELECT id, code FROM projects WHERE code = $1", project_code)
                 if not proj:

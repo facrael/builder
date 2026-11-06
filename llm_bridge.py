@@ -53,9 +53,12 @@ class Handler(BaseHTTPRequestHandler):
         try:
             length = int(self.headers.get("Content-Length", 0))
             payload = json.loads(self.rfile.read(length) or b"{}")
-            # Force the server model: callers send arbitrary names like
-            # "hermes-agent" which OpenRouter rejects -> JSON error without 'choices'.
-            payload["model"] = DEFAULT_MODEL
+            # Honor explicit OpenRouter models (e.g. vision models contain "/"):
+            # they pass through. Bare placeholder names like "hermes-agent" are
+            # replaced with the server default, OpenRouter rejects them.
+            requested = str(payload.get("model") or "")
+            if "/" not in requested:
+                payload["model"] = DEFAULT_MODEL
             payload.pop("stream_options", None)
             data = json.dumps(payload).encode()
             req = urllib.request.Request(
