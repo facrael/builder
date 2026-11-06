@@ -17,7 +17,8 @@ from pdf_engine import (
     crop_drawing_fragment,
     extract_pdf_context,
     render_full_sheet,
-    get_multimodal_context_pages
+    get_multimodal_context_pages,
+    select_pages_by_vision
 )
 from obsidian import sync_document_card
 
@@ -657,24 +658,36 @@ async def cmd_ask_hermes(message: Message):
     await message.answer(clean_answer)
 
     # И ТОЛЬКО ПОСЛЕ ЭТОГО, если модель подтвердила наличие и указала страницу:
+    target_idx = None
     if sheet_match and not is_refusal and pdf_path and os.path.exists(pdf_path):
         target_page_1based = int(sheet_match.group(1))
         if 1 <= target_page_1based <= total_doc_pages:
             target_idx = target_page_1based - 1
-            full_sheet = render_full_sheet(
-                pdf_path=pdf_path,
-                page_index=target_idx,
-                user_fullname=user["full_name"],
-                doc_meta=f"{doc['code']} Изм.{doc['revision']}"
-            )
-            if os.path.exists(full_sheet):
-                await message.answer_photo(
-                    FSInputFile(full_sheet),
-                    caption=(
-                        f"📐 Чертеж из комплекта `{doc['code']}` (PDF-стр. {target_page_1based}, Изм. {doc['revision']})\n"
-                        f"⚠️ *Сверяйте отметки и узлы по полному листу РД.*"
-                    )
+    elif not is_refusal and not sheet_match and pdf_path and os.path.exists(pdf_path):
+        # Модель ответила по существу, но забыла тег [SHEET: N] — лист
+        # выбирает vision-модель по содержанию страниц.
+        try:
+            v_pages = select_pages_by_vision(pdf_path, question, max_pages=1)
+            if v_pages:
+                target_idx = v_pages[0]
+        except Exception as e:
+            print(f"[sheet fallback vision] {e}", flush=True)
+
+    if target_idx is not None and pdf_path and os.path.exists(pdf_path):
+        full_sheet = render_full_sheet(
+            pdf_path=pdf_path,
+            page_index=target_idx,
+            user_fullname=user["full_name"],
+            doc_meta=f"{doc['code']} Изм.{doc['revision']}"
+        )
+        if os.path.exists(full_sheet):
+            await message.answer_photo(
+                FSInputFile(full_sheet),
+                caption=(
+                    f"📐 Чертеж из комплекта `{doc['code']}` (PDF-стр. {target_idx + 1}, Изм. {doc['revision']}; номер листа см. в штампе)\n"
+                    f"⚠️ *Сверяйте отметки и узлы по полному листу РД.*"
                 )
+            )
 
 # Catch-all: любой свободный текст (не команда, не документ) — как вопрос в LLM.
 # Регистрируется последним, поэтому команды и документы обрабатываются раньше.
