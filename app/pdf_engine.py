@@ -697,3 +697,70 @@ def crop_drawing_fragment(
         results.append(rendered)
 
     return results
+
+def find_sheet_page(pdf_path: str, sheet_number: int, radius: int = 2) -> int:
+    """Физическая страница (1-based), в штампе которой стоит 'Лист <sheet_number>'.
+
+    Номер листа в ведомости/штампе != физический номер страницы PDF
+    (титульный лист не входит в нумерацию штампов), поэтому кандидаты
+    ищутся в радиусе +/- radius. Сначала текстовый слой, затем vision
+    по миниатюрам. Возвращает 0, если не найдено.
+    """
+    doc = pymupdf.open(pdf_path)
+    total = len(doc)
+    doc.close()
+    if sheet_number < 1 or sheet_number > total + radius:
+        return 0
+
+    def candidates():
+        for delta in range(0, radius + 1):
+            for sign in ((1, -1) if delta else (1,)):
+                p = sheet_number - 1 + sign * delta
+                if 0 <= p < total:
+                    yield p
+
+    # 1) Текстовый слой
+    doc = pymupdf.open(pdf_path)
+    for p in candidates():
+        text = doc[p].get_text() or ""
+        if re.search(rf"лист\s*{sheet_number}\b", text, re.IGNORECASE):
+            doc.close()
+            return p + 1
+    doc.close()
+
+    # 2) Vision: читаем графу 'Лист' в штампе каждого кандидата
+    try:
+        from vision_model import get_vision_model
+        model = get_vision_model()
+        api_url = os.environ.get("OPENROUTER_API_URL", "https://openrouter.ai/api/v1/chat/completions")
+        api_key = os.environ.get("OPENROUTER_API_KEY")
+        doc = pymupdf.open(pdf_path)
+        for p in candidates():
+            pix = doc[p].get_pixmap(dpi=90)
+            b64 = base64.b64encode(pix.tobytes("png")).decode("utf-8")
+            payload = {
+                "model": model,
+                "max_tokens": 2000,
+                "temperature": 0.1,
+                "messages": [{"role": "user", "content": [
+                    {"type": "text", "text": "Какой номер листа указан в основной надписи (штампе) чертежа, графа 'Лист'? Ответь одним числом без пояснений. Если штампа с номером листа нет — ответь 0."},
+                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
+                ]}],
+            }
+            headers = {"Content-Type": "application/json"}
+            if api_key:
+                headers["Authorization"] = f"Bearer {api_key}"
+            req = urllib.request.Request(api_url, data=json.dumps(payload).encode("utf-8"), headers=headers)
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                msg = json.loads(resp.read().decode("utf-8"))["choices"][0]["message"]
+                answer = msg.get("content") or ""
+                if not answer:
+                    answer = json.dumps(msg, ensure_ascii=False)
+            m = re.search(r"\d+", answer)
+            if m and int(m.group()) == sheet_number:
+                doc.close()
+                return p + 1
+        doc.close()
+    except Exception as e:
+        print(f"[find_sheet_page] {e}", flush=True)
+    return 0

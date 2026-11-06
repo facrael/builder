@@ -743,6 +743,18 @@ async def cmd_ask_hermes(message: Message):
         except Exception as e:
             print(f"[sheet fallback vision] {e}", flush=True)
 
+    # Сверка с штампом: [SHEET: N] от модели — номер ЛИСТА (по ведомости),
+    # а физическая страница сдвинута на титульные листы. Ищем страницу,
+    # в штампе которой стоит именно этот номер листа.
+    if sheet_match and not is_refusal and pdf_path and os.path.exists(pdf_path):
+        from pdf_engine import find_sheet_page
+        try:
+            stamp_page = find_sheet_page(pdf_path, int(sheet_match.group(1)))
+            if stamp_page:
+                target_idx = stamp_page - 1
+        except Exception as e:
+            print(f"[stamp check] {e}", flush=True)
+
     if target_idx is not None and pdf_path and os.path.exists(pdf_path):
         full_sheet = render_full_sheet(
             pdf_path=pdf_path,
