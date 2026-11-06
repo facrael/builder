@@ -2,7 +2,7 @@ import asyncpg
 import os
 import json
 import secrets
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 CLEARANCE_ORDER = {"L0": 0, "L1": 1, "L2": 2}
