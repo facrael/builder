@@ -443,7 +443,13 @@ def render_full_sheet(
     """
     doc = pymupdf.open(pdf_path)
     page = doc[page_index]
-    
+
+    # Лимит Telegram: сторона фото <= 10000 px и соотношение сторон <= 20.
+    # Ограничиваем dpi так, чтобы длинная сторона не превышала 8000 px.
+    max_side_pt = max(page.rect.width, page.rect.height)
+    max_dpi = int(8000 * 72.0 / max_side_pt)
+    dpi = min(dpi, max(72, max_dpi))
+
     # Создаем копию страницы для нанесения водяного знака
     temp_doc = pymupdf.open()
     temp_page = temp_doc.new_page(width=page.rect.width, height=page.rect.height)

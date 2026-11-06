@@ -681,13 +681,24 @@ async def cmd_ask_hermes(message: Message):
             doc_meta=f"{doc['code']} Изм.{doc['revision']}"
         )
         if os.path.exists(full_sheet):
-            await message.answer_photo(
-                FSInputFile(full_sheet),
-                caption=(
-                    f"📐 Чертеж из комплекта `{doc['code']}` (PDF-стр. {target_idx + 1}, Изм. {doc['revision']}; номер листа см. в штампе)\n"
-                    f"⚠️ *Сверяйте отметки и узлы по полному листу РД.*"
+            try:
+                await message.answer_photo(
+                    FSInputFile(full_sheet),
+                    caption=(
+                        f"📐 Чертеж из комплекта `{doc['code']}` (PDF-стр. {target_idx + 1}, Изм. {doc['revision']}; номер листа см. в штампе)\n"
+                        f"⚠️ *Сверяйте отметки и узлы по полному листу РД.*"
+                    )
                 )
-            )
+            except Exception as photo_err:
+                # Telegram отклонил фото (размеры/вес) — шлём как документ без сжатия.
+                print(f"[send sheet] photo rejected: {photo_err}", flush=True)
+                await message.answer_document(
+                    FSInputFile(full_sheet),
+                    caption=(
+                        f"📐 Чертеж из комплекта `{doc['code']}` (PDF-стр. {target_idx + 1}, Изм. {doc['revision']}; номер листа см. в штампе)\n"
+                        f"⚠️ *Сверяйте отметки и узлы по полному листу РД.*"
+                    )
+                )
 
 # Catch-all: любой свободный текст (не команда, не документ) — как вопрос в LLM.
 # Регистрируется последним, поэтому команды и документы обрабатываются раньше.
