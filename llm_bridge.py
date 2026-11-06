@@ -12,6 +12,7 @@ import urllib.request
 
 ENV_PATH = "/root/.hermes/.env"
 DEFAULT_MODEL = os.getenv("BRIDGE_MODEL", "z-ai/glm-5.3-flash")
+VISION_MODEL = os.getenv("BRIDGE_VISION_MODEL", "google/gemini-2.5-flash")
 UPSTREAM = "https://openrouter.ai/api/v1/chat/completions"
 
 
@@ -59,6 +60,10 @@ class Handler(BaseHTTPRequestHandler):
             requested = str(payload.get("model") or "")
             if "/" not in requested:
                 payload["model"] = DEFAULT_MODEL
+            # Text-only default models silently ignore images; route any
+            # multimodal request (image_url parts) to a vision-capable model.
+            if "image_url" in json.dumps(payload) and VISION_MODEL:
+                payload["model"] = VISION_MODEL
             payload.pop("stream_options", None)
             data = json.dumps(payload).encode()
             req = urllib.request.Request(
