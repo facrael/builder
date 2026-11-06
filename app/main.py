@@ -397,8 +397,11 @@ async def query_llm(system_prompt: str, user_prompt: str, image_base64_list: lis
             "X-Title": "Construction Registry Bot",
             "Content-Type": "application/json"
         }
+        # Текстовые запросы — на основную модель; запросы с картинками — на
+        # vision-модель (основная glm-5.3-flash игнорирует изображения, проверено).
+        vision_model = os.getenv("BRIDGE_VISION_MODEL", "z-ai/glm-4.6v")
         payload = {
-            "model": OPENROUTER_MODEL,
+            "model": vision_model if image_base64_list else OPENROUTER_MODEL,
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_content}
@@ -418,11 +421,16 @@ async def query_llm(system_prompt: str, user_prompt: str, image_base64_list: lis
         }
         url = HERMES_API_URL
 
-    async with httpx.AsyncClient(timeout=60.0) as client:
+    async with httpx.AsyncClient(timeout=180.0) as client:
         resp = await client.post(url, headers=headers, json=payload)
         resp.raise_for_status()
         data = resp.json()
-        return data["choices"][0]["message"]["content"]
+        msg = data["choices"][0]["message"]
+        # Reasoning-модели (glm-4.6v и др.) могут вернуть content=None —
+        # тогда отдаём всё сообщение целиком (в нём есть reasoning/текст).
+        if msg.get("content"):
+            return msg["content"]
+        return json.dumps(msg, ensure_ascii=False)
 
 
 def parse_query_intent(query: str, known_projects: list[str] = None) -> dict:
