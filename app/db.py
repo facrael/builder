@@ -247,6 +247,26 @@ class Database:
             )
             return dict(row) if row else None
 
+    async def list_available_docs_summary(self, user: dict) -> list[dict]:
+        """Возвращает список доступных пользователю активных документов по проектам."""
+        allowed_levels = [
+            lvl for lvl, rank in CLEARANCE_ORDER.items()
+            if rank <= CLEARANCE_ORDER.get(user["max_clearance"], 0)
+        ]
+        async with self.pool.acquire() as conn:
+            query = """
+                SELECT p.code as project_code, d.code as doc_code, d.section, d.revision
+                FROM documents d
+                JOIN projects p ON d.project_id = p.id
+                JOIN user_projects up ON up.project_id = p.id
+                WHERE up.user_id = $1
+                  AND d.status = 'active'
+                  AND d.security_level = ANY($2::varchar[])
+                ORDER BY p.code, d.section, d.code
+            """
+            rows = await conn.fetch(query, user["id"], allowed_levels)
+            return [dict(r) for r in rows]
+
     async def save_pending_upload(self, tg_id: int, upload: PendingUpload):
         """Сохраняет черновик загрузки в БД (UPSERT)."""
         async with self.pool.acquire() as conn:

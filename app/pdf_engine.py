@@ -98,15 +98,28 @@ def parse_filename_meta(filename: str) -> dict:
 
     # 3. Потенциальный код объекта
     obj_candidate = None
+    TRANSLIT_PROJ = {
+        "KNS": "КНС", "КНС": "КНС", "KHC": "КНС",
+        "CTP": "ЦТП", "ЦТП": "ЦТП",
+        "OTI": "ОТИ", "ОТИ": "ОТИ",
+        "ITP": "ИТП", "ИТП": "ИТП",
+        "TP": "ТП", "ТП": "ТП",
+        "RP": "РП", "РП": "РП",
+        "BKTP": "БКТП", "БКТП": "БКТП",
+        "GRSH": "ГРЩ", "ГРЩ": "ГРЩ"
+    }
     # Приоритетные имена известных объектов
     for token in tokens:
         up = token.upper()
-        if up in ("ЦТП", "КНС", "ТП", "ИТП", "РП", "БКТП", "ГРЩ"):
-            obj_candidate = up
+        if up in TRANSLIT_PROJ:
+            obj_candidate = TRANSLIT_PROJ[up]
             break
     if not obj_candidate:
         for token in tokens:
             clean_tok = re.sub(r'(?:ДСП|КТ|РД|П)$', '', token, flags=re.I).upper()
+            if clean_tok in TRANSLIT_PROJ:
+                obj_candidate = TRANSLIT_PROJ[clean_tok]
+                break
             if clean_tok in ("ДСП", "РД", "П", "ГИП", "ПТО", "ЛИСТ", "ИЗМ", "ИЗМ1", "ИЗМ2", "ИЗМ3", "ОПОРЫ", "ПЛОЩАДКИ", ""):
                 continue
             if re.search(r'^(ЖК|КОРПУС|БЛОК|СКЛАД|КОТЕЛЬНАЯ|[А-ЯA-Z]\d{3,})', clean_tok, re.IGNORECASE):
@@ -136,6 +149,85 @@ def parse_filename_meta(filename: str) -> dict:
     }
 
 
+def parse_gost_stamp_by_vision(pdf_path: str) -> dict:
+    """
+    Vision-парсинг обложки (стр. 1) и листа со штампом (стр. 3) для сканов без текста.
+    Определяет project_code (КНС/ЦТП/ОТИ), section (АР/КЖ/КМ) и code (ЦКДИ.../Э756...).
+    """
+    api_url = os.environ.get("OPENROUTER_API_URL", "https://openrouter.ai/api/v1/chat/completions")
+    api_key = os.environ.get("OPENROUTER_API_KEY")
+    model = os.environ.get("OPENROUTER_MODEL") or os.environ.get("BRIDGE_VISION_MODEL", "google/gemini-2.5-flash")
+
+    if not api_key:
+        api_url = os.environ.get("HERMES_API_URL", "http://host.docker.internal:8000/v1/chat/completions")
+        model = os.environ.get("HERMES_MODEL", "hermes-agent")
+
+    try:
+        doc = pymupdf.open(pdf_path)
+        total_p = len(doc)
+        if total_p == 0:
+            return {}
+
+        pages_to_render = [0]
+        if total_p >= 3:
+            pages_to_render.append(2)  # Стр. 3 (Лист со штампом Форма 3)
+        elif total_p > 1:
+            pages_to_render.append(total_p - 1)
+
+        content = [{
+            "type": "text",
+            "text": (
+                "Ты опытный инженер ПТО. Перед тобой сканы обложки (стр. 1) и листа со штампом (стр. 3) "
+                "строительного альбома рабочей документации.\n"
+                "Определи по этим изображениям:\n"
+                "1. project_code: краткий код объекта или здания (КНС, ЦТП, ОТИ, ТП, ИТП, РП или др.). "
+                "Например, если написано 'Павильоны КНС' -> 'КНС', если 'Здание ЦТП' -> 'ЦТП', если 'Здание ОТИ' -> 'ОТИ'.\n"
+                "2. section: марка раздела проекта (АР, КЖ, КМ, КР, ОВ, ВК, ЭОМ и т.п.). Если в шифре написано АР5 -> 'АР', КЖ -> 'КЖ', КМ10 -> 'КМ'.\n"
+                "3. code: полный шифр комплекта из штампа или центра обложки (например: 'ЦКДИ.2981.АР3', 'ЦКДИ.2981.КЖ', 'Э756дспИ2').\n\n"
+                "Ответь СТРОГО валидным JSON-объектом без пояснений и без markdown:\n"
+                '{"project_code": "КНС", "section": "АР", "code": "ЦКДИ.2981.АР3"}'
+            )
+        }]
+
+        for p_idx in pages_to_render:
+            pix = doc[p_idx].get_pixmap(dpi=110)
+            b64 = base64.b64encode(pix.tobytes("png")).decode("utf-8")
+            content.append({"type": "text", "text": f"Страница {p_idx + 1}:"})
+            content.append({"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}})
+        doc.close()
+
+        payload = {
+            "model": model,
+            "messages": [{"role": "user", "content": content}],
+            "max_tokens": 150,
+            "temperature": 0.1
+        }
+        headers = {"Content-Type": "application/json"}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+
+        req = urllib.request.Request(
+            api_url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers=headers
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            answer = json.loads(resp.read().decode("utf-8"))["choices"][0]["message"]["content"]
+
+        m_json = re.search(r'\{[^{}]*\}', answer)
+        if m_json:
+            data = json.loads(m_json.group(0))
+            return {
+                "project_code": (data.get("project_code") or "").strip().upper(),
+                "section": (data.get("section") or "").strip().upper(),
+                "code": (data.get("code") or "").strip().upper()
+            }
+    except Exception as e:
+        print(f"[parse_gost_stamp_by_vision] error: {e}", flush=True)
+
+    return {}
+
+
 def extract_gost_stamp_info(pdf_path: str, filename: str = "") -> dict:
     """
     Многостраничный умный поиск основной надписи по ГОСТ Р 21.101.
@@ -157,13 +249,22 @@ def extract_gost_stamp_info(pdf_path: str, filename: str = "") -> dict:
     # Шаг 1: Проверяем центральный заголовок титульного листа (Лист 1 и 2)
     # По ГОСТу там крупно написано: 'Основной комплект рабочих чертежей\nЦКДИ.2981.КМ10'
     title_code = None
+    title_proj = None
     for p_idx in range(min(2, total_pages)):
         page_full_text = doc[p_idx].get_text("text")
+        # Нормализация OCR-латиницы в кириллицу (например, KHC -> КНС, AP -> АР)
+        table = str.maketrans('ABCEHKMOPTXYabcehkmoptxy', 'АВСЕНКМОРТХУавсенкмортху')
+        norm_text = page_full_text.translate(table)
+
+        # Поиск кода проекта на титуле/обложке (Павильоны КНС, Здание ЦТП, Здание ОТИ)
+        m_proj = re.search(r'\b(КНС|ЦТП|ОТИ|ИТП|ТП|РП|БКТП|ГРЩ)\b', norm_text, re.IGNORECASE)
+        if m_proj and not title_proj:
+            title_proj = m_proj.group(1).upper()
         
-        # Поиск паттернов вида ЦКДИ.2981.КМ10, 2981-КМ10
+        # Поиск паттернов вида ЦКДИ.2981.КМ10, 2981-КМ10, ЦКДИ.2981.АР3
         m_title = re.search(
             r'(?:Основной комплект|рабочих чертежей)?[\s\S]{0,40}?([А-ЯA-Z]{2,4}[._\s]*\d{3,5}[._\s]*[А-ЯA-Z]{2}\d*)',
-            page_full_text,
+            norm_text,
             re.IGNORECASE
         )
         if m_title:
@@ -231,6 +332,17 @@ def extract_gost_stamp_info(pdf_path: str, filename: str = "") -> dict:
     pix.save(best_stamp_image)
     doc.close()
 
+    # Шаг 4: Если текстовый слой пуст или шифр не распознан (скан без OCR):
+    # Запускаем Vision-парсинг обложки (стр. 1) и листа со штампом (стр. 3)
+    if best_score < 20 or not (best_code or title_code):
+        v_meta = parse_gost_stamp_by_vision(pdf_path)
+        if v_meta.get("project_code"):
+            title_proj = v_meta["project_code"]
+        if v_meta.get("section"):
+            best_section = v_meta["section"]
+        if v_meta.get("code"):
+            best_code = v_meta["code"]
+
     # Итоговый выбор шифра:
     # 1. Шифр из полноценного штампа Формы 3
     # 2. Шифр с титула ("Основной комплект рабочих чертежей ...")
@@ -245,13 +357,14 @@ def extract_gost_stamp_info(pdf_path: str, filename: str = "") -> dict:
         or best_section 
         or fn_meta["section"]
     )
+    final_project = title_proj or fn_meta.get("project_code")
 
     return {
         "raw_text": stamp_text if 'stamp_text' in locals() else "",
         "detected_code": final_code,
         "detected_section": final_section,
         "suggested_sec_level": fn_meta["sec_level"],
-        "suggested_project": fn_meta["project_code"],
+        "suggested_project": final_project,
         "stamp_image": best_stamp_image,
         "stamp_page_number": best_page_idx + 1
     }
