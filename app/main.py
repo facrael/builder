@@ -793,6 +793,30 @@ async def cmd_ask_hermes(message: Message):
                     )
                 )
 
+    # ВТОРАЯ СТУПЕНЬ (как в Hermes): если лист найден — читаем его vision-моделью
+    # и отправляем инженеру конкретные данные с чертежа (размеры, армирование, отметки).
+    if target_idx is not None and pdf_path and os.path.exists(pdf_path):
+        try:
+            import pymupdf as _pymupdf
+            _doc = _pymupdf.open(pdf_path)
+            pix = _doc[target_idx].get_pixmap(dpi=150)
+            import base64 as _b64
+            sheet_b64 = _b64.b64encode(pix.tobytes("png")).decode("utf-8")
+            _doc.close()
+            detail = await query_llm(
+                "Ты опытный инженер ПТО. Тебе передан лист рабочей документации (скан чертежа). "
+                "Внимательно прочитай ВСЕ надписи, размеры, отметки, спецификации и штамп на листе.",
+                f"Вопрос инженера: {question}\n\n"
+                "Прочитай чертёж и ответь на вопрос конкретными данными с листа: размеры, отметки, "
+                "армирование, материалы, спецификации — всё, что видно. Если на листе нет нужных данных, "
+                "честно скажи, что именно на листе отсутствует. Без тегов и служебных пометок.",
+                [sheet_b64]
+            )
+            if detail:
+                await message.answer(detail[:4000])
+        except Exception as e:
+            print(f"[sheet detail read] {e}", flush=True)
+
 # Catch-all: любой свободный текст (не команда, не документ) — как вопрос в LLM.
 # Регистрируется последним, поэтому команды и документы обрабатываются раньше.
 @dp.message(F.text, ~F.text.startswith("/"))
