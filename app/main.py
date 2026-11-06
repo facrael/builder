@@ -3,6 +3,7 @@ import hashlib
 import os
 import re
 import httpx
+import pymupdf
 from pathlib import Path
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, FSInputFile, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
