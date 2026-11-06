@@ -247,6 +247,36 @@ class Database:
             )
             return dict(row) if row else None
 
+    async def list_active_docs_with_acl(
+        self, user: dict, doc_type: str = None, section: str = None,
+        query_code: str = None, project_code: str = None
+    ) -> list[dict]:
+        """Как find_active_doc_with_acl, но возвращает ВСЕ активные документы (для мульти-комплектного контекста)."""
+        allowed_levels = [
+            lvl for lvl, rank in CLEARANCE_ORDER.items()
+            if rank <= CLEARANCE_ORDER.get(user["max_clearance"], 0)
+        ]
+        async with self.pool.acquire() as conn:
+            query = """
+                SELECT d.*, p.code as project_code, up.allowed_sections
+                FROM documents d
+                JOIN projects p ON d.project_id = p.id
+                JOIN user_projects up ON up.project_id = p.id
+                WHERE up.user_id = $1
+                  AND d.status = 'active'
+                  AND d.security_level = ANY($2::varchar[])
+                  AND ($3::varchar IS NULL OR d.doc_type ILIKE $3)
+                  AND ($4::varchar IS NULL OR d.section ILIKE $4)
+                  AND ($5::varchar IS NULL OR d.code ILIKE '%' || $5 || '%')
+                  AND ($6::varchar IS NULL OR p.code ILIKE $6)
+                  AND (cardinality(up.allowed_sections) = 0 OR d.section = ANY(up.allowed_sections))
+                ORDER BY d.revision DESC, d.created_at DESC
+            """
+            rows = await conn.fetch(
+                query, user["id"], allowed_levels, doc_type, section, query_code, project_code
+            )
+            return [dict(r) for r in rows]
+
     async def list_available_docs_summary(self, user: dict) -> list[dict]:
         """Возвращает список доступных пользователю активных документов по проектам."""
         allowed_levels = [

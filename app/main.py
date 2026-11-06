@@ -566,49 +566,105 @@ async def cmd_ask_hermes(message: Message):
     vision_images = []
     total_doc_pages = 0
     pdf_path = None
-    
-    if doc:
-        pdf_path = doc.get("file_path")
-        sec_level = doc.get("security_level", "L0")
+
+    # Собираем ВСЕ активные комплекты по объекту — контекст берём из каждого,
+    # а не только из последнего найденного.
+    docs_all = []
+    if req_proj:
+        docs_all = await db.list_active_docs_with_acl(
+            user, doc_type="РД", query_code=req_code, project_code=req_proj
+        )
+        if not docs_all:
+            # Не нашли по объекту в целом — честный отказ (фолбэк на чужой объект запрещен)
+            summary = await db.list_available_docs_summary(user)
+            if not summary:
+                await message.answer(
+                    f"❌ По объекту **«{req_proj}»** документов в реестре нет.\n"
+                    f"В базе пока не зарегистрировано ни одного комплекта РД."
+                )
+            else:
+                by_proj = {}
+                for item in summary:
+                    p = item["project_code"]
+                    by_proj.setdefault(p, []).append(f"{item['doc_code']} ({item['section']})")
+                proj_list = [f"• **{p}**: {', '.join(codes)}" for p, codes in by_proj.items()]
+                await message.answer(
+                    f"❌ По объекту **«{req_proj}»** документов в реестре нет.\n\n"
+                    f"📋 **В реестре доступны объекты:**\n" + "\n".join(proj_list) + "\n\n"
+                    f"💡 Чтобы добавить документацию по {req_proj}, отправьте PDF-файл в чат."
+                )
+            return
+    else:
+        # Объект не назван — берём все доступные активные комплекты
+        docs_all = await db.list_active_docs_with_acl(user, doc_type="РД", query_code=req_code)
+        if not docs_all and req_sec:
+            docs_all = await db.list_active_docs_with_acl(user, doc_type="РД", section=req_sec)
+        if not docs_all:
+            docs_all = await db.list_active_docs_with_acl(user, doc_type="РД")
+
+    # doc = основной комплект (приоритет: совпадение раздела с запросом)
+    doc = None
+    if docs_all:
+        if req_sec:
+            for d in docs_all:
+                if (d.get("section") or "").upper() == req_sec.upper():
+                    doc = d
+                    break
+        if not doc:
+            doc = docs_all[0]
+
+    doc_ctx_parts = []
+    doc_meta_map = {}
+    for d in docs_all:
+        d_path = d.get("file_path")
+        sec_level = d.get("security_level", "L0")
         if sec_level in ("L1", "L2"):
-            # ЖЕСТКАЯ ЗАЩИТА В КОДЕ: тело и коммерческие тайны L1 никогда не отправляются в LLM!
-            portal_link = f"{INTERNAL_PORTAL_URL}/{doc['id']}"
-            context_info = (
-                f"Документ: Шифр '{doc['code']}', Объект '{doc['project_code']}', Изм. {doc['revision']}, Гриф: {sec_level} (Коммерческая тайна / Сметы).\n"
+            portal_link = f"{INTERNAL_PORTAL_URL}/{d['id']}"
+            doc_ctx_parts.append(
+                f"### Комплект '{d['code']}' (Объект '{d['project_code']}', Раздел '{d['section']}', Изм. {d['revision']}, Гриф: {sec_level})\n"
                 f"ВНИМАНИЕ СИСТЕМЫ ИБ: Текстовое содержимое скрыто на уровне шлюза безопасности.\n"
-                f"Единственное разрешенное действие: предоставить сотруднику ссылку для открытия через защищенный VPN: {portal_link}"
+                f"Единственное разрешенное действие: предоставить ссылку {portal_link}"
+            )
+            continue
+        d_pages = 0
+        if d_path and os.path.exists(d_path):
+            dobj = pymupdf.open(d_path)
+            d_pages = len(dobj)
+            dobj.close()
+        d_content = extract_pdf_context(d_path, question, max_pages=3)
+        d_scanned = ("пуст или сканирован" in d_content) or (len(d_content.strip()) < 150)
+        if d_scanned:
+            doc_ctx_parts.append(
+                f"### Комплект '{d['code']}' (Объект '{d['project_code']}', Раздел '{d['section']}', Изм. {d['revision']}, Гриф L0, страниц: {d_pages})\n"
+                f"Документ графический (скан, без текстового слоя). Содержание листов не извлечено текстом; {d_pages} страниц."
             )
         else:
-            if pdf_path and os.path.exists(pdf_path):
-                doc_obj = pymupdf.open(pdf_path)
-                total_doc_pages = len(doc_obj)
-                doc_obj.close()
+            doc_ctx_parts.append(
+                f"### Комплект '{d['code']}' (Объект '{d['project_code']}', Раздел '{d['section']}', Изм. {d['revision']}, Гриф L0, страниц: {d_pages})\n"
+                f"=== ДАННЫЕ ИЗ ЛИСТОВ ===\n{d_content}"
+            )
+        doc_meta_map[d["code"]] = {"path": d_path, "pages": d_pages, "revision": d["revision"]}
 
-            # Извлекаем реальный контекст листов из PDF (RAG)
+    context_info = "\n\n".join(doc_ctx_parts) if doc_ctx_parts else "Доступных актуальных документов для текущего пользователя в реестре не найдено."
+
+    if doc:
+        pdf_path = doc.get("file_path")
+        if pdf_path and os.path.exists(pdf_path):
+            doc_obj = pymupdf.open(pdf_path)
+            total_doc_pages = len(doc_obj)
+            doc_obj.close()
+        sec_level = doc.get("security_level", "L0")
+        if sec_level not in ("L1", "L2") and pdf_path and os.path.exists(pdf_path):
             pdf_content = extract_pdf_context(pdf_path, question, max_pages=3)
-            
-            # Проверяем, скан ли это (пустой или почти пустой текстовый слой)
             is_scanned_pdf = ("пуст или сканирован" in pdf_content) or (len(pdf_content.strip()) < 150)
-            
-            if is_scanned_pdf and pdf_path and os.path.exists(pdf_path):
-                # Подключаем Vision: рендерим страницы чертежа в base64 для мультимодальной модели
+            if is_scanned_pdf:
                 pages_meta = get_multimodal_context_pages(pdf_path, query=question, max_pages=2)
                 vision_images = [p["base64"] for p in pages_meta]
                 sheet_nums = [p["sheet_number"] for p in pages_meta]
-                context_info = (
-                    f"Актуальный документ: Шифр '{doc['code']}', Объект '{doc['project_code']}', Раздел '{doc['section']}', "
-                    f"Изм. {doc['revision']}, Статус: АКТУАЛЕН (Гриф L0), Всего страниц: {total_doc_pages}.\n"
-                    f"ВНИМАНИЕ: Документ является графическим чертежом/сканом. К запросу прикреплены изображения страниц {sheet_nums}.\n"
-                    f"Внимательно изучи прикрепленные сканы чертежей своими глазами (Vision): найди штамп, название чертежа, отметки, размеры, спецификации и ответь на вопрос инженера."
+                context_info += (
+                    f"\n\nВНИМАНИЕ: основной комплект '{doc['code']}' — графический скан. К запросу прикреплены изображения его страниц {sheet_nums}.\n"
+                    f"Внимательно изучи прикрепленные сканы чертежей своими глазами (Vision): найди штамп, название чертежа, отметки, размеры и ответь на вопрос инженера."
                 )
-            else:
-                context_info = (
-                    f"Актуальный документ: Шифр '{doc['code']}', Объект '{doc['project_code']}', Раздел '{doc['section']}', "
-                    f"Изм. {doc['revision']}, Статус: АКТУАЛЕН (Гриф L0), Всего страниц: {total_doc_pages}.\n\n"
-                    f"=== ДАННЫЕ ИЗ ЛИСТОВ ЧЕРТЕЖА ===\n{pdf_content}"
-                )
-    else:
-        context_info = "Доступных актуальных документов для текущего пользователя в реестре не найдено."
 
     system_prompt_path = Path(__file__).resolve().parent.parent / "AGENT_SYSTEM_PROMPT.md"
     if system_prompt_path.exists():
@@ -623,10 +679,11 @@ async def cmd_ask_hermes(message: Message):
         f"{system_prompt}\n\n"
         f"Контекст реестра:\n{context_info}\n\n"
         "ВАЖНОЕ ПРАВИЛО ДЛЯ ГРАФИЧЕСКИХ ДАННЫХ (схемы, узлы, разрезы, фасады, планы):\n"
-        "Если пользователь запрашивает чертеж, схему, узел, фасад или разрез, и ты НАШЕЛ точный ответ на конкретной странице PDF: "
-        f"обязательно укажи в самом конце своего ответа технический тег: [SHEET: N] (где N — физический номер страницы PDF от 1 до {total_doc_pages or 10}, где находится этот чертеж).\n"
-        "Если запрашиваемого узла/фасада/объекта в переданном документе НЕТ или данных недостаточно: "
-        "НЕ УКАЗЫВАЙ тег [SHEET: N] и прямо скажи, что в переданном комплекте этих данных нет."
+        f"В реестре передано НЕСКОЛЬКО комплектов. Если пользователь запрашивает чертеж, схему, узел, фасад или разрез, и ты НАШЕЛ его в комплекте '{doc['code']}' на конкретной странице PDF: "
+        f"укажи в самом конце ответа теги: [SHEET: N] (N — физический номер страницы от 1 до {total_doc_pages or 10} ЭТОГО комплекта).\n"
+        "Если нужный чертёж находится в ДРУГОМ комплекте из контекста — укажи оба тега: [DOC: шифр_комплекта] и [SHEET: N] (N — физическая страница в PDF этого комплекта).\n"
+        "Если запрашиваемого узла/фасада/объекта НИ В ОДНОМ переданном комплекте нет или данных недостаточно: "
+        "НЕ УКАЗЫВАЙ теги и прямо скажи, что в переданных комплектах этих данных нет."
     )
 
     try:
@@ -650,9 +707,21 @@ async def cmd_ask_hermes(message: Message):
     ]
     is_refusal = any(rw in answer.lower() for rw in refusal_keywords)
 
-    # 2. Ищем тег [SHEET: N]
+    # 2. Ищем теги [DOC: шифр] и [SHEET: N]
+    doc_tag = re.search(r'\[DOC:\s*([^\]\s]+)\]', answer)
     sheet_match = re.search(r'\[SHEET:\s*(\d+)\]', answer)
-    clean_answer = re.sub(r'\[SHEET:\s*\d+\]', '', answer).strip()
+    clean_answer = re.sub(r'\[(?:SHEET:\s*\d+|DOC:\s*[^\]]+)\]', '', answer).strip()
+
+    # Фото берём из комплекта, который указала модель ([DOC: ...]); иначе — основной.
+    send_doc = doc
+    if doc_tag and doc_meta_map:
+        tag_code = doc_tag.group(1).upper()
+        if tag_code in doc_meta_map:
+            m = doc_meta_map[tag_code]
+            send_doc = {"code": tag_code, "revision": m["revision"],
+                        "project_code": doc.get("project_code") if doc else ""}
+            pdf_path = m["path"]
+            total_doc_pages = m["pages"]
 
     # Сначала ВСЕГДА отправляем текстовый ответ инженеру
     await message.answer(clean_answer)
@@ -678,14 +747,14 @@ async def cmd_ask_hermes(message: Message):
             pdf_path=pdf_path,
             page_index=target_idx,
             user_fullname=user["full_name"],
-            doc_meta=f"{doc['code']} Изм.{doc['revision']}"
+            doc_meta=f"{send_doc['code']} Изм.{send_doc['revision']}"
         )
         if os.path.exists(full_sheet):
             try:
                 await message.answer_photo(
                     FSInputFile(full_sheet),
                     caption=(
-                        f"📐 Чертеж из комплекта `{doc['code']}` (PDF-стр. {target_idx + 1}, Изм. {doc['revision']}; номер листа см. в штампе)\n"
+                        f"📐 Чертеж из комплекта `{send_doc['code']}` (PDF-стр. {target_idx + 1}, Изм. {send_doc['revision']}; номер листа см. в штампе)\n"
                         f"⚠️ *Сверяйте отметки и узлы по полному листу РД.*"
                     )
                 )
@@ -695,7 +764,7 @@ async def cmd_ask_hermes(message: Message):
                 await message.answer_document(
                     FSInputFile(full_sheet),
                     caption=(
-                        f"📐 Чертеж из комплекта `{doc['code']}` (PDF-стр. {target_idx + 1}, Изм. {doc['revision']}; номер листа см. в штампе)\n"
+                        f"📐 Чертеж из комплекта `{send_doc['code']}` (PDF-стр. {target_idx + 1}, Изм. {send_doc['revision']}; номер листа см. в штампе)\n"
                         f"⚠️ *Сверяйте отметки и узлы по полному листу РД.*"
                     )
                 )
