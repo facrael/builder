@@ -156,11 +156,13 @@ def parse_gost_stamp_by_vision(pdf_path: str) -> dict:
     """
     api_url = os.environ.get("OPENROUTER_API_URL", "https://openrouter.ai/api/v1/chat/completions")
     api_key = os.environ.get("OPENROUTER_API_KEY")
-    model = os.environ.get("OPENROUTER_MODEL") or os.environ.get("BRIDGE_VISION_MODEL", "google/gemini-2.5-flash")
+    # Основная OPENROUTER_MODEL (glm-5.3-flash) — текстовая и НЕ видит картинки,
+    # поэтому штамп всегда читает vision-модель (та же, что в llm_bridge).
+    model = os.environ.get("BRIDGE_VISION_MODEL", "z-ai/glm-4.6v")
 
     if not api_key:
         api_url = os.environ.get("HERMES_API_URL", "http://host.docker.internal:8000/v1/chat/completions")
-        model = os.environ.get("HERMES_MODEL", "hermes-agent")
+        model = os.environ.get("BRIDGE_VISION_MODEL", "z-ai/glm-4.6v")
 
     try:
         doc = pymupdf.open(pdf_path)
@@ -199,7 +201,7 @@ def parse_gost_stamp_by_vision(pdf_path: str) -> dict:
         payload = {
             "model": model,
             "messages": [{"role": "user", "content": content}],
-            "max_tokens": 150,
+            "max_tokens": 1000,
             "temperature": 0.1
         }
         headers = {"Content-Type": "application/json"}
@@ -211,8 +213,12 @@ def parse_gost_stamp_by_vision(pdf_path: str) -> dict:
             data=json.dumps(payload).encode("utf-8"),
             headers=headers
         )
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            answer = json.loads(resp.read().decode("utf-8"))["choices"][0]["message"]["content"]
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            msg = json.loads(resp.read().decode("utf-8"))["choices"][0]["message"]
+            # Reasoning-модели могут вернуть content=None.
+            answer = msg.get("content") or ""
+            if not answer:
+                answer = json.dumps(msg, ensure_ascii=False)
 
         m_json = re.search(r'\{[^{}]*\}', answer)
         if m_json:
