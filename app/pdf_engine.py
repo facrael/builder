@@ -329,7 +329,7 @@ def render_full_sheet(
     temp_page.show_pdf_page(temp_page.rect, doc, page_index)
 
     watermark_text = (
-        f"АКТУАЛЬНО | {doc_meta} | Лист {page_index + 1}\n"
+        f"АКТУАЛЬНО | {doc_meta} | PDF-стр. {page_index + 1} (номер листа сверяйте по штампу)\n"
         f"Выдано: {user_fullname} | ПРОВЕРЬ ПО ЛИСТУ-ИСТОЧНИКУ"
     )
     _insert_cyrillic_textbox(

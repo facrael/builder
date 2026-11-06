@@ -521,7 +521,7 @@ async def cmd_ask_hermes(message: Message):
                         await message.answer_photo(
                             FSInputFile(full_sheet),
                             caption=(
-                                f"📐 Чертеж из актуального комплекта `{doc['code']}` (Лист {target_p + 1}, Изм. {doc['revision']})\n"
+                                f"📐 Чертеж из актуального комплекта `{doc['code']}` (PDF-стр. {target_p + 1}, Изм. {doc['revision']}; номер листа см. в штампе)\n"
                                 f"⚠️ *Сверяйте отметки и узлы по полному листу РД.*"
                             )
                         )
