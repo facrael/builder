@@ -472,7 +472,7 @@ def select_pages_by_vision(pdf_path: str, query: str, max_pages: int = 2) -> lis
         payload = {
             "model": model,
             "messages": [{"role": "user", "content": content}],
-            "max_tokens": 100,
+            "max_tokens": 1000,
         }
         req = urllib.request.Request(
             api_url,
@@ -480,7 +480,11 @@ def select_pages_by_vision(pdf_path: str, query: str, max_pages: int = 2) -> lis
             headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
         )
         with urllib.request.urlopen(req, timeout=120) as resp:
-            answer = json.loads(resp.read().decode("utf-8"))["choices"][0]["message"]["content"]
+            msg = json.loads(resp.read().decode("utf-8"))["choices"][0]["message"]
+            # Reasoning-модели могут класть ответ в content=None; ищем текст где есть.
+            answer = msg.get("content") or ""
+            if not answer:
+                answer = json.dumps(msg, ensure_ascii=False)
         nums = [int(n) for n in re.findall(r"\d+", answer)]
         valid = [n - 1 for n in nums if 1 <= n]
         # Оставляем только реально существовавшие альбомные страницы
