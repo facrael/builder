@@ -502,14 +502,19 @@ async def cmd_ask_hermes(message: Message):
                 
                 # 2. Если точные координаты не найдены (скан) — отправляем альбомный лист чертежа целиком!
                 if not sent_photo:
-                    doc_obj = pymupdf.open(pdf_path)
-                    # В строительных альбомах чертежи и схемы всегда на альбомных листах (Landscape)
-                    landscape_sheets = [i for i, p in enumerate(doc_obj) if p.rect.width > p.rect.height]
-                    if landscape_sheets:
-                        target_p = landscape_sheets[0]  # Первый лист со схемой чертежа (например, Лист 8: Опалубка)
+                    # Приоритет: страница, которую Vision сам счёл релевантной запросу
+                    # (get_multimodal_context_pages уже отработал выше для сканов).
+                    if is_scanned_pdf and pages_meta:
+                        target_p = pages_meta[0]["sheet_index"]
                     else:
-                        target_p = 2 if len(doc_obj) >= 3 else 0
-                    doc_obj.close()
+                        doc_obj = pymupdf.open(pdf_path)
+                        # В строительных альбомах чертежи и схемы всегда на альбомных листах (Landscape)
+                        landscape_sheets = [i for i, p in enumerate(doc_obj) if p.rect.width > p.rect.height]
+                        if landscape_sheets:
+                            target_p = landscape_sheets[0]
+                        else:
+                            target_p = 2 if len(doc_obj) >= 3 else 0
+                        doc_obj.close()
 
                     full_sheet = render_full_sheet(
                         pdf_path=pdf_path,

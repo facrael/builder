@@ -2,6 +2,8 @@ import pymupdf
 import re
 import os
 import base64
+import json
+import urllib.request
 from pathlib import Path
 
 MM_TO_PT = 72.0 / 25.4  # 1 мм ≈ 2.8346 pt
@@ -360,8 +362,16 @@ def get_multimodal_context_pages(pdf_path: str, query: str = "", max_pages: int 
 
     doc = pymupdf.open(pdf_path)
     total_pages = len(doc)
-    
+
     tokens = [w.lower()[:4] for w in re.findall(r'[а-яa-z0-9]{4,}', query, re.I)]
+
+    # 0. Vision-подбор страниц: сканы не имеют текстового слоя, поэтому
+    # релевантные листы выбирает мультимодальная модель по миниатюрам.
+    vision_pages = select_pages_by_vision(pdf_path, query, max_pages=max_pages)
+    if vision_pages:
+        selected_indices = vision_pages[:max_pages]
+        doc.close()
+        return _build_page_meta(pdf_path, selected_indices, query)
     
     # 1. Проверяем, есть ли текст
     scored = []
@@ -397,8 +407,19 @@ def get_multimodal_context_pages(pdf_path: str, query: str = "", max_pages: int 
     # Сортируем листы по порядку следования
     selected_indices = sorted(list(set(selected_indices))[:max_pages])
 
+    results = _build_page_meta(pdf_path, selected_indices, query, dpi=dpi)
+
+    doc.close()
+    return results
+
+
+def _build_page_meta(pdf_path: str, page_indices: list, query: str = "", dpi: int = 120) -> list[dict]:
+    """Рендерит выбранные страницы в base64 для Vision-модели."""
+    doc = pymupdf.open(pdf_path)
     results = []
-    for p_idx in selected_indices:
+    for p_idx in sorted(set(page_indices)):
+        if p_idx < 0 or p_idx >= len(doc):
+            continue
         page = doc[p_idx]
         pix = page.get_pixmap(dpi=dpi)
         b64_str = base64.b64encode(pix.tobytes("png")).decode("utf-8")
@@ -407,9 +428,70 @@ def get_multimodal_context_pages(pdf_path: str, query: str = "", max_pages: int 
             "sheet_number": p_idx + 1,
             "base64": b64_str
         })
-
     doc.close()
     return results
+
+
+def select_pages_by_vision(pdf_path: str, query: str, max_pages: int = 2) -> list[int]:
+    """
+    Выбирает страницы скана под запрос: рендерит альбомные листы в миниатюры
+    и просит мультимодальную модель указать, на каких страницах находится
+    искомое содержание. Возвращает 0-based индексы страниц; [] = не удалось.
+    """
+    api_url = os.environ.get("HERMES_API_URL", "http://host.docker.internal:8000/v1/chat/completions")
+    model = os.environ.get("OPENROUTER_MODEL") or os.environ.get("HERMES_MODEL")
+    api_key = os.environ.get("OPENROUTER_API_KEY")
+    if not (model and api_key and query):
+        return []
+
+    try:
+        doc = pymupdf.open(pdf_path)
+        landscape = [i for i in range(len(doc)) if doc[i].rect.width > doc[i].rect.height]
+        if not landscape:
+            return []
+        thumbs = []
+        content: list = [{
+            "type": "text",
+            "text": (
+                f"Вопрос инженера: «{query}».\n"
+                "Ниже миниатюры страниц PDF-альбома чертежей (под каждой подпись «Страница N»). "
+                "Определи, на каких страницах находится содержание, которое запрашивают. "
+                "Если запрашивают конкретный фасад/разрез/узел — выбери страницы, где он изображен. "
+                "Ответь ТОЛЬКО JSON-массивом физических номеров страниц в порядке убывания релевантности, "
+                'например: [8, 9]. Без пояснений.'
+            ),
+        }]
+        for idx in landscape:
+            pix = doc[idx].get_pixmap(dpi=70)
+            b64 = base64.b64encode(pix.tobytes("png")).decode("utf-8")
+            thumbs.append(idx)
+            content.append({"type": "text", "text": f"Страница {idx + 1}:"})
+            content.append({"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}})
+        doc.close()
+
+        payload = {
+            "model": model,
+            "messages": [{"role": "user", "content": content}],
+            "max_tokens": 100,
+        }
+        req = urllib.request.Request(
+            api_url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
+        )
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            answer = json.loads(resp.read().decode("utf-8"))["choices"][0]["message"]["content"]
+        nums = [int(n) for n in re.findall(r"\d+", answer)]
+        valid = [n - 1 for n in nums if 1 <= n]
+        # Оставляем только реально существовавшие альбомные страницы
+        out = []
+        for p in valid:
+            if p in landscape and p not in out:
+                out.append(p)
+        return out[:max_pages]
+    except Exception as e:
+        print(f"[select_pages_by_vision] fallback to heuristic: {e}", flush=True)
+        return []
 
 
 def render_drawing_fragment(
