@@ -399,7 +399,8 @@ async def query_llm(system_prompt: str, user_prompt: str, image_base64_list: lis
         }
         # Текстовые запросы — на основную модель; запросы с картинками — на
         # vision-модель (основная glm-5.3-flash игнорирует изображения, проверено).
-        vision_model = os.getenv("BRIDGE_VISION_MODEL", "z-ai/glm-4.6v")
+        from vision_model import get_vision_model
+        vision_model = get_vision_model()
         payload = {
             "model": vision_model if image_base64_list else OPENROUTER_MODEL,
             "messages": [

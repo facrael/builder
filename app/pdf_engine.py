@@ -5,6 +5,7 @@ import base64
 import json
 import urllib.request
 from pathlib import Path
+from vision_model import get_vision_model
 
 MM_TO_PT = 72.0 / 25.4  # 1 мм ≈ 2.8346 pt
 
@@ -158,11 +159,11 @@ def parse_gost_stamp_by_vision(pdf_path: str) -> dict:
     api_key = os.environ.get("OPENROUTER_API_KEY")
     # Основная OPENROUTER_MODEL (glm-5.3-flash) — текстовая и НЕ видит картинки,
     # поэтому штамп всегда читает vision-модель (та же, что в llm_bridge).
-    model = os.environ.get("BRIDGE_VISION_MODEL", "z-ai/glm-4.6v")
+    model = get_vision_model()
 
     if not api_key:
         api_url = os.environ.get("HERMES_API_URL", "http://host.docker.internal:8000/v1/chat/completions")
-        model = os.environ.get("BRIDGE_VISION_MODEL", "z-ai/glm-4.6v")
+        model = get_vision_model()
 
     try:
         doc = pymupdf.open(pdf_path)
