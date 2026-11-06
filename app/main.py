@@ -730,10 +730,8 @@ async def cmd_ask_hermes(message: Message):
             pdf_path = m["path"]
             total_doc_pages = m["pages"]
 
-    # Сначала ВСЕГДА отправляем текстовый ответ инженеру
-    await message.answer(clean_answer)
-
-    # И ТОЛЬКО ПОСЛЕ ЭТОГО, если модель подтвердила наличие и указала страницу:
+    # Текстовый ответ отправляем СРАЗУ только когда лист не находится —
+    # если лист найден, сначала читаем его и шлём один сводный ответ.
     target_idx = None
     if sheet_match and not is_refusal and pdf_path and os.path.exists(pdf_path):
         target_page_1based = int(sheet_match.group(1))
@@ -772,7 +770,31 @@ async def cmd_ask_hermes(message: Message):
         except Exception as e:
             print(f"[stamp check] {e}", flush=True)
 
-    if target_idx is not None and pdf_path and os.path.exists(pdf_path):
+    if target_idx is None or not pdf_path or not os.path.exists(pdf_path):
+        # Лист не найден (или отказ) — сразу отдаём текстовый ответ, ничего не ждём.
+        await message.answer(clean_answer)
+    else:
+        # Лист найден: сначала читаем его (2-я ступень), потом шлём фото + ОДИН сводный ответ.
+        detail = ""
+        try:
+            import pymupdf as _pymupdf
+            _doc = _pymupdf.open(pdf_path)
+            pix = _doc[target_idx].get_pixmap(dpi=150)
+            import base64 as _b64
+            sheet_b64 = _b64.b64encode(pix.tobytes("png")).decode("utf-8")
+            _doc.close()
+            detail = await query_llm(
+                "Ты опытный инженер ПТО. Тебе передан лист рабочей документации (скан чертежа). "
+                "Внимательно прочитай ВСЕ надписи, размеры, отметки, спецификации и штамп на листе.",
+                f"Вопрос инженера: {question}\n\n"
+                "Прочитай чертёж и ответь на вопрос конкретными данными с листа: размеры, отметки, "
+                "армирование, материалы, спецификации — всё, что видно. Если на листе нет нужных данных, "
+                "честно скажи, что именно на листе отсутствует. Без тегов и служебных пометок.",
+                [sheet_b64]
+            )
+        except Exception as e:
+            print(f"[sheet detail read] {e}", flush=True)
+
         full_sheet = render_full_sheet(
             pdf_path=pdf_path,
             page_index=target_idx,
@@ -799,29 +821,9 @@ async def cmd_ask_hermes(message: Message):
                     )
                 )
 
-    # ВТОРАЯ СТУПЕНЬ (как в Hermes): если лист найден — читаем его vision-моделью
-    # и отправляем инженеру конкретные данные с чертежа (размеры, армирование, отметки).
-    if target_idx is not None and pdf_path and os.path.exists(pdf_path):
-        try:
-            import pymupdf as _pymupdf
-            _doc = _pymupdf.open(pdf_path)
-            pix = _doc[target_idx].get_pixmap(dpi=150)
-            import base64 as _b64
-            sheet_b64 = _b64.b64encode(pix.tobytes("png")).decode("utf-8")
-            _doc.close()
-            detail = await query_llm(
-                "Ты опытный инженер ПТО. Тебе передан лист рабочей документации (скан чертежа). "
-                "Внимательно прочитай ВСЕ надписи, размеры, отметки, спецификации и штамп на листе.",
-                f"Вопрос инженера: {question}\n\n"
-                "Прочитай чертёж и ответь на вопрос конкретными данными с листа: размеры, отметки, "
-                "армирование, материалы, спецификации — всё, что видно. Если на листе нет нужных данных, "
-                "честно скажи, что именно на листе отсутствует. Без тегов и служебных пометок.",
-                [sheet_b64]
-            )
-            if detail:
-                await message.answer(detail[:4000])
-        except Exception as e:
-            print(f"[sheet detail read] {e}", flush=True)
+        # Итоговый ответ — один: данные с листа; если чтение сорвалось — первый ответ.
+        final_text = (detail or "").strip() or clean_answer
+        await message.answer(final_text[:4000])
 
 # Catch-all: любой свободный текст (не команда, не документ) — как вопрос в LLM.
 # Регистрируется последним, поэтому команды и документы обрабатываются раньше.
