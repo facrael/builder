@@ -698,7 +698,7 @@ def crop_drawing_fragment(
 
     return results
 
-def find_sheet_page(pdf_path: str, sheet_number: int, radius: int = 2) -> int:
+def find_sheet_page(pdf_path: str, sheet_number: int, radius: int = 2, expect: str = "") -> int:
     """Физическая страница (1-based), в штампе которой стоит 'Лист <sheet_number>'.
 
     Номер листа в ведомости/штампе != физический номер страницы PDF
@@ -757,9 +757,33 @@ def find_sheet_page(pdf_path: str, sheet_number: int, radius: int = 2) -> int:
                 if not answer:
                     answer = json.dumps(msg, ensure_ascii=False)
             m = re.search(r"\d+", answer)
-            if m and int(m.group()) == sheet_number:
-                doc.close()
-                return p + 1
+            if not (m and int(m.group()) == sheet_number):
+                continue
+            # Страница со штампом листа найдена; при expect дополнительно
+            # сверяем СОДЕРЖАНИЕ листа с запрошенной конструкцией — модель
+            # может назвать неверный номер листа, и по штампу найдётся сосед.
+            if expect:
+                content_q = (
+                    f"Есть ли на этом листе чертежа упоминание или изображение «{expect}»? "
+                    "Посмотри наименование в штампе и заголовки на поле чертежа. "
+                    "Ответь только 'да' или 'нет'."
+                )
+                payload2 = dict(payload)
+                payload2["messages"] = [{"role": "user", "content": [
+                    {"type": "text", "text": content_q},
+                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
+                ]}]
+                req2 = urllib.request.Request(api_url, data=json.dumps(payload2).encode("utf-8"), headers=headers)
+                with urllib.request.urlopen(req2, timeout=120) as resp2:
+                    msg2 = json.loads(resp2.read().decode("utf-8"))["choices"][0]["message"]
+                    answer2 = (msg2.get("content") or json.dumps(msg2, ensure_ascii=False)).strip().lower()
+                if "да" in answer2[:40]:
+                    doc.close()
+                    return p + 1
+                print(f"[find_sheet_page] штамп листа {sheet_number} на стр. {p + 1}, но «{expect}» там нет — ищу дальше", flush=True)
+                continue
+            doc.close()
+            return p + 1
         doc.close()
     except Exception as e:
         print(f"[find_sheet_page] {e}", flush=True)

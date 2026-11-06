@@ -355,6 +355,12 @@ async def cancel_upload(call: CallbackQuery):
     else:
         await call.message.edit_text("❌ Загрузка документа отменена пользователем.")
 
+
+def _expect_phrase(question: str) -> str:
+    """Короткое имя запрошенной конструкции для сверки содержимого листа."""
+    m = re.search(r"(ростверк|фундамент|схема|план|фасад|узел|разрез|опалубка|армирование)\s*[а-яё]*\s*[а-яА-ЯР0-9.,\-]{0,12}", question.lower())
+    return m.group(0).strip() if m else ""
+
 async def query_llm(system_prompt: str, user_prompt: str, image_base64_list: list[str] = None) -> str:
     """
     Универсальный вызов LLM:
@@ -741,7 +747,7 @@ async def cmd_ask_hermes(message: Message):
         if m_sheet_txt:
             try:
                 from pdf_engine import find_sheet_page
-                stamp_page = find_sheet_page(pdf_path, int(m_sheet_txt.group(1)))
+                stamp_page = find_sheet_page(pdf_path, int(m_sheet_txt.group(1)), expect=_expect_phrase(question))
                 if stamp_page:
                     target_idx = stamp_page - 1
             except Exception as e:
@@ -760,7 +766,7 @@ async def cmd_ask_hermes(message: Message):
     if sheet_match and not is_refusal and pdf_path and os.path.exists(pdf_path):
         from pdf_engine import find_sheet_page
         try:
-            stamp_page = find_sheet_page(pdf_path, int(sheet_match.group(1)))
+            stamp_page = find_sheet_page(pdf_path, int(sheet_match.group(1)), expect=_expect_phrase(question))
             if stamp_page:
                 target_idx = stamp_page - 1
         except Exception as e:
