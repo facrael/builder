@@ -734,14 +734,25 @@ async def cmd_ask_hermes(message: Message):
         if 1 <= target_page_1based <= total_doc_pages:
             target_idx = target_page_1based - 1
     elif not is_refusal and not sheet_match and pdf_path and os.path.exists(pdf_path):
-        # Модель ответила по существу, но забыла тег [SHEET: N] — лист
-        # выбирает vision-модель по содержанию страниц.
-        try:
-            v_pages = select_pages_by_vision(pdf_path, question, max_pages=1)
-            if v_pages:
-                target_idx = v_pages[0]
-        except Exception as e:
-            print(f"[sheet fallback vision] {e}", flush=True)
+        # Модель ответила по существу, но забыла тег [SHEET: N].
+        # Сначала пробуем вытащить номер листа из текста ответа («Лист 9 — План кровли»),
+        # затем — vision-подбор по содержанию страниц.
+        m_sheet_txt = re.search(r"лист[а-я]*\s*[№]?\s*(\d{1,2})", clean_answer.lower())
+        if m_sheet_txt:
+            try:
+                from pdf_engine import find_sheet_page
+                stamp_page = find_sheet_page(pdf_path, int(m_sheet_txt.group(1)))
+                if stamp_page:
+                    target_idx = stamp_page - 1
+            except Exception as e:
+                print(f"[answer-sheet check] {e}", flush=True)
+        if target_idx is None:
+            try:
+                v_pages = select_pages_by_vision(pdf_path, question, max_pages=1)
+                if v_pages:
+                    target_idx = v_pages[0]
+            except Exception as e:
+                print(f"[sheet fallback vision] {e}", flush=True)
 
     # Сверка с штампом: [SHEET: N] от модели — номер ЛИСТА (по ведомости),
     # а физическая страница сдвинута на титульные листы. Ищем страницу,
