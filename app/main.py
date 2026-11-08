@@ -20,8 +20,7 @@ from pdf_engine import (
     render_full_sheet,
     get_multimodal_context_pages,
     select_pages_by_vision,
-    extract_document_sheets,
-    normalize_code
+    extract_document_sheets
 )
 from obsidian import sync_document_card
 
@@ -986,10 +985,9 @@ async def auto_index_documents(user: dict = None) -> str:
     # они попадут в реестр только после нажатия «Подтвердить».
     try:
         pending_rows = await db.pool.fetch("SELECT sha256, file_path FROM pending_uploads")
-        pending_hashes = {r["sha256"] for r in pending_rows}
         pending_paths = {r["file_path"] for r in pending_rows}
     except Exception:
-        pending_hashes, pending_paths = set(), set()
+        pending_paths = set()
 
     for pdf_file in STORAGE_DIR.glob("*.pdf"):
         if str(pdf_file) in existing_paths or pdf_file.stem.lower() in existing_codes:
@@ -1027,8 +1025,8 @@ async def auto_index_documents(user: dict = None) -> str:
     summary = (
         f"📋 **Результаты индексации реестра чертежей:**\n\n" +
         ("\n".join(report_lines) if report_lines else "Документов для индексации не обнаружено.") +
-        f"\n\nВсего проиндексировано листов: **{total_indexed}**.\n"
-        f"Быстрый FTS-поиск и карта проектов активны!"
+        "\n\nВсего проиндексировано листов: **" + str(total_indexed) + "**.\n"
+        "Быстрый FTS-поиск и карта проектов активны!"
     )
     return summary
 
