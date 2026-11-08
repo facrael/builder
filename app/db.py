@@ -418,11 +418,12 @@ class Database:
 
         async with self.pool.acquire() as conn:
             sql = """
-                SELECT ds.*, d.code as doc_code, d.revision, d.section, d.file_path, d.security_level,
-                       p.code as project_code,
-                       ts_rank(ds.tsv, plainto_tsquery('russian', $1)) as rank,
-                       ts_rank(to_tsvector('russian', coalesce(ds.title, '')), plainto_tsquery('russian', $1)) as title_rank,
-                       similarity(ds.title, $1) as sim
+                SELECT * FROM (
+                    SELECT ds.*, d.code as doc_code, d.revision, d.section, d.file_path, d.security_level,
+                           p.code as project_code,
+                           ts_rank(ds.tsv, plainto_tsquery('russian', $1)) as rank,
+                           ts_rank(to_tsvector('russian', coalesce(ds.title, '')), plainto_tsquery('russian', $1)) as title_rank,
+                           similarity(ds.title, $1) as sim
                 FROM doc_sheets ds
                 JOIN documents d ON ds.doc_id = d.id
                 JOIN projects p ON d.project_id = p.id
@@ -436,7 +437,8 @@ class Database:
                       OR ds.tags && $5::text[]
                       OR similarity(ds.title, $1) > 0.15
                   )
-                ORDER BY (title_rank * 5 + rank + sim) DESC, ds.sheet_number ASC
+                ) t
+                ORDER BY (title_rank * 5 + rank + sim) DESC, sheet_number ASC
                 LIMIT 1
             """
             row = await conn.fetchrow(sql, clean_q, allowed_levels, project_code, section, query_tokens)
