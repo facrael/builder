@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import hashlib
 import json
 import os
@@ -6,8 +7,8 @@ import re
 import httpx
 import pymupdf
 from pathlib import Path
-from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, FSInputFile, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from aiogram import Bot, Dispatcher, F, BaseMiddleware
+from aiogram.types import Message, FSInputFile, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, TelegramObject
 from aiogram.filters import Command
 from aiogram.client.session.aiohttp import AiohttpSession
 
@@ -18,14 +19,60 @@ from pdf_engine import (
     extract_pdf_context,
     render_full_sheet,
     get_multimodal_context_pages,
-    select_pages_by_vision
+    select_pages_by_vision,
+    extract_document_sheets,
+    normalize_code
 )
 from obsidian import sync_document_card
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 PROXY_URL = os.getenv("TELEGRAM_PROXY_URL")
 ADMIN_TG_ID = int(os.getenv("ADMIN_TG_ID", "0"))
+ALLOWED_TELEGRAM_IDS_RAW = os.getenv("ALLOWED_TELEGRAM_IDS", "").strip()
 INTERNAL_PORTAL_URL = os.getenv("INTERNAL_PORTAL_URL")
+
+def get_allowed_tg_ids() -> set[int]:
+    """Возвращает множество разрешенных Telegram ID (белый список)."""
+    allowed = set()
+    if ALLOWED_TELEGRAM_IDS_RAW:
+        for part in re.split(r'[,;\s]+', ALLOWED_TELEGRAM_IDS_RAW):
+            if part.strip().isdigit():
+                allowed.add(int(part.strip()))
+    if ADMIN_TG_ID:
+        allowed.add(ADMIN_TG_ID)
+    return allowed
+
+def is_user_allowed(tg_id: int) -> bool:
+    """Проверяет, входит ли пользователь в белый список."""
+    allowed = get_allowed_tg_ids()
+    if not allowed:
+        return True  # если список не задан, доступ не блокируется
+    return tg_id in allowed
+
+class WhitelistMiddleware(BaseMiddleware):
+    """
+    Middleware доступа по белому списку TG ID:
+    - Неавторизованным пользователям выдает понятное сообщение с их TG ID.
+    - Пользователям из белого списка автоматически гарантирует полный доступ (admin, L2).
+    """
+    async def __call__(self, handler, event: TelegramObject, data: dict):
+        user = getattr(event, "from_user", None)
+        if user and not is_user_allowed(user.id):
+            if isinstance(event, Message):
+                await event.answer(
+                    f"⛔ **Доступ ограничен.**\n\n"
+                    f"Ваш Telegram ID: <code>{user.id}</code> не внесён в белый список (`ALLOWED_TELEGRAM_IDS` в `.env`).\n"
+                    f"Обратитесь к администратору для добавления."
+                )
+            elif isinstance(event, CallbackQuery):
+                await event.answer("⛔ Доступ ограничен (нет в белом списке).", show_alert=True)
+            return
+
+        if user:
+            data_db = data.get("db") or db
+            await data_db.ensure_whitelist_user(user.id, user.full_name or "Инженер")
+
+        return await handler(event, data)
 
 # Настройки LLM: OpenRouter или локальный Hermes / vLLM / Ollama
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
@@ -337,12 +384,29 @@ async def confirm_upload(call: CallbackQuery):
     obsidian_path = sync_document_card(saved_doc)
     await db.log_audit(user["id"], "UPLOAD_NEW_REVISION", saved_doc["id"], {"rev": saved_doc["revision"]})
 
+    # Постраничная индексация чертежа в doc_sheets для мгновенного FTS-поиска
+    indexed_cnt = 0
+    if saved_doc.get("file_path") and saved_doc["file_path"].lower().endswith(".pdf"):
+        try:
+            sheets_data = extract_document_sheets(
+                saved_doc["file_path"],
+                filename=saved_doc["code"],
+                cipher=saved_doc["code"]
+            )
+            if sheets_data:
+                await db.index_document_sheets(saved_doc["id"], sheets_data)
+                indexed_cnt = len(sheets_data)
+        except Exception as e:
+            print(f"[confirm_upload index_document_sheets error] {e}", flush=True)
+
+    sheets_msg = f"\n📐 Проиндексировано листов: **{indexed_cnt}** (доступен быстрый FTS-поиск)" if indexed_cnt else ""
+
     await call.message.edit_caption(
         caption=(
             f"✅ **Зарегистрировано в реестре!**\n"
             f"Шифр: `{saved_doc['code']}` | **Ревизия (Изм.): {saved_doc['revision']}**\n"
             f"Предыдущая ревизия автоматически переведена в статус `заменён`.\n"
-            f"Карточка Obsidian обновлена: `{obsidian_path}`"
+            f"Карточка Obsidian обновлена: `{obsidian_path}`{sheets_msg}"
         )
     ) if call.message.photo else await call.message.edit_text("Зарегистрировано!")
 
@@ -620,7 +684,15 @@ async def cmd_ask_hermes(message: Message):
         if not doc:
             doc = docs_all[0]
 
-    doc_ctx_parts = []
+    # 0. Быстрый FTS-поиск листа по постраничному индексу doc_sheets
+    target_sheet = await db.search_sheets_fts(
+        user, question, project_code=req_proj, section=req_sec
+    )
+
+    # 1. Построение карты проекта per-user (реестр доступных комплектов и листов)
+    project_map = await db.get_project_sheets_map(user, project_code=req_proj)
+
+    doc_ctx_parts = [project_map]
     doc_meta_map = {}
     for d in docs_all:
         d_path = d.get("file_path")
@@ -654,7 +726,26 @@ async def cmd_ask_hermes(message: Message):
 
     context_info = "\n\n".join(doc_ctx_parts) if doc_ctx_parts else "Доступных актуальных документов для текущего пользователя в реестре не найдено."
 
-    if doc:
+    # Если FTS нашел конкретный лист — прикрепляем его скан в Vision
+    if target_sheet:
+        t_path = target_sheet.get("file_path")
+        t_idx = target_sheet.get("page_index")
+        if t_path and os.path.exists(t_path) and t_idx is not None:
+            try:
+                t_doc = pymupdf.open(t_path)
+                t_pix = t_doc[t_idx].get_pixmap(dpi=120)
+                t_b64 = base64.b64encode(t_pix.tobytes("png")).decode("utf-8")
+                t_doc.close()
+                vision_images = [t_b64]
+                context_info += (
+                    f"\n\n🎯 FTS-ПОИСК НАШЁЛ ЦЕЛЕВОЙ ЛИСТ: Комплект '{target_sheet['doc_code']}', "
+                    f"Лист {target_sheet.get('sheet_number') or (t_idx+1)} (PDF-стр. {t_idx+1}): «{target_sheet['title']}».\n"
+                    f"Изображение этого листа прикреплено в Vision для считывания размеров, отметок и штампа."
+                )
+            except Exception as e:
+                print(f"[fts sheet vision attach] {e}", flush=True)
+
+    if not vision_images and doc:
         pdf_path = doc.get("file_path")
         if pdf_path and os.path.exists(pdf_path):
             doc_obj = pymupdf.open(pdf_path)
@@ -758,6 +849,18 @@ async def cmd_ask_hermes(message: Message):
             except Exception as e:
                 print(f"[sheet fallback vision] {e}", flush=True)
 
+    # 3. Fallback на лист, ранее найденный быстрым FTS-индексом
+    if target_idx is None and target_sheet and not is_refusal:
+        t_path = target_sheet.get("file_path")
+        if t_path and os.path.exists(t_path):
+            target_idx = target_sheet["page_index"]
+            pdf_path = t_path
+            send_doc = {
+                "code": target_sheet["doc_code"],
+                "revision": target_sheet["revision"],
+                "project_code": target_sheet["project_code"]
+            }
+
     # Сверка с штампом: [SHEET: N] от модели — номер ЛИСТА (по ведомости),
     # а физическая страница сдвинута на титульные листы. Ищем страницу,
     # в штампе которой стоит именно этот номер листа.
@@ -834,6 +937,10 @@ async def catch_all_question(message: Message):
 
 async def main():
     await db.connect()
+    # Подключение проверки доступа по белому списку TG ID
+    dp.message.outer_middleware(WhitelistMiddleware())
+    dp.callback_query.outer_middleware(WhitelistMiddleware())
+
     if ADMIN_TG_ID:
         await db.ensure_admin(ADMIN_TG_ID)
     print("🚀 Бот строительного реестра запущен...")

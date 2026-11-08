@@ -1,4 +1,5 @@
 CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+CREATE EXTENSION IF NOT EXISTS "pg_trgm";
 
 -- =====================================================
 -- ПОЛЬЗОВАТЕЛИ
@@ -72,6 +73,29 @@ CREATE UNIQUE INDEX idx_one_active_per_code
 
 -- Защита от загрузки дубликатов (тот же файл)
 CREATE UNIQUE INDEX idx_docs_sha256 ON documents(sha256);
+
+-- =====================================================
+-- ПОСТРАНИЧНЫЙ РЕЕСТР ЛИСТОВ ЧЕРТЕЖЕЙ (FTS + pg_trgm)
+-- =====================================================
+
+CREATE TABLE IF NOT EXISTS doc_sheets (
+    id SERIAL PRIMARY KEY,
+    doc_id INT REFERENCES documents(id) ON DELETE CASCADE,
+    page_index INT NOT NULL,                  -- 0-based индекс страницы PDF (0, 1, 2...)
+    sheet_number INT,                         -- номер листа по ГОСТ (1, 2, 3...)
+    title TEXT NOT NULL,                      -- наименование листа из штампа/ведомости
+    tags TEXT[] DEFAULT '{}',                 -- теги ['опалубка', 'плита', 'фасад', 'кровля'...]
+    text_content TEXT DEFAULT '',             -- извлечённый текст листа
+    tsv tsvector,                             -- полнотекстовый индекс (russian)
+    is_landscape BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE (doc_id, page_index)
+);
+
+CREATE INDEX IF NOT EXISTS idx_doc_sheets_lookup ON doc_sheets(doc_id, page_index);
+CREATE INDEX IF NOT EXISTS idx_doc_sheets_tsv ON doc_sheets USING gin(tsv);
+CREATE INDEX IF NOT EXISTS idx_doc_sheets_title_trgm ON doc_sheets USING gin(title gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS idx_documents_code_trgm ON documents USING gin(code gin_trgm_ops);
 
 -- =====================================================
 -- ИНВАЙТ-КОДЫ (регистрация сотрудников)

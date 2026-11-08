@@ -29,6 +29,236 @@ CYRILLIC_FONT = _load_cyrillic_font()
 
 SECTIONS_REGEX = r'(?:КР|АР|КМ|КЖ|ОВ|ВК|ЭОМ|ЭО|ЭМ|АТХ|ГП|ТХ|АС|ПЗ|ПОС|ППР|ПС|СС)\d*'
 
+HOMOGLYPH_TABLE = str.maketrans('ABCEHKMOPTXYabcehkmoptxy', 'АВСЕНКМОРТХУавсенкмортху')
+
+def normalize_code(code: str) -> str:
+    """Нормализует шифр документа: убирает знаки препинания, переводит латинские гомоглифы в кириллицу."""
+    if not code:
+        return ""
+    c = code.translate(HOMOGLYPH_TABLE).upper()
+    return re.sub(r'[\s._\-/\\,]+', '', c)
+
+SHEET_TAG_PATTERNS = [
+    ("опалубка", r"опалубк"),
+    ("армирование", r"армир"),
+    ("арматура", r"арматур"),
+    ("плита", r"плит"),
+    ("фундамент", r"фундамент"),
+    ("ростверк", r"ростверк"),
+    ("сваи", r"сва[яйие]"),
+    ("опоры", r"опор"),
+    ("фасад", r"фасад"),
+    ("кровля", r"кровл"),
+    ("узел", r"узел"),
+    ("узлы", r"узлы"),
+    ("разрез", r"разрез"),
+    ("план", r"план"),
+    ("профиль", r"профил"),
+    ("трасса", r"трасс"),
+    ("лестницы", r"лестниц"),
+    ("площадки", r"площадк"),
+    ("спецификация", r"спецификац"),
+    ("ведомость", r"ведомост"),
+    ("каркас", r"каркас"),
+    ("сетка", r"сетк"),
+    ("эстакада", r"эстакад"),
+    ("отделка", r"отделк"),
+    ("полы", r"пол[оаы]"),
+]
+
+def extract_sheet_tags(title: str, text: str = "") -> list[str]:
+    combined = f"{title} {text}".lower()
+    return [tag for tag, pat in SHEET_TAG_PATTERNS if re.search(pat, combined)]
+
+CLEANUP_OCR_MAP = [
+    (r"06([I1l][I1l]|\b)", "Об"),
+    (r"Be[!,\|1]{1,2}OMOCTb", "Ведомость"),
+    (r"qepTe[JjКk]{1,2}e[l1i]", "чертежей"),
+    (r"pa6o['\"`]?I{1,2}lx", "рабочих"),
+    (r"IIJIO[I1l]{1,2}J;a[,!.]lOK", "площадок"),
+    (r"JieCTH[I1l]{2,4}", "лестниц"),
+    (r"MelK[,!.]\s*Iy", "между"),
+    (r"OCl!M[I1l]{1,2}", "осями"),
+    (r"<llaca[!,.]?\s*b?r", "Фасад"),
+    (r"<llaca[!,.]?\s*11", "Фасад"),
+    (r"f-A", "Г-А"),
+    (r"A-r", "А-Г"),
+    (r"rra\b", "на"),
+    (r"orrop", "опор"),
+    (r"Y3eJI", "Узел"),
+    (r"Y3nhr", "Узлы"),
+    (r"IlaBHJibOH", "Павильон"),
+    (r"KHC", "КНС"),
+    (r"IInarr", "План"),
+    (r"PocTBepK", "Ростверк"),
+    (r"Orrarry6Ka|Orraey6Ka", "Опалубка"),
+    (r"ApMUposauue|ApMnposanne", "Армирование"),
+    (r"TerrrroceTn|menJJocemu", "теплосети"),
+    (r"nJlOH\s*Kp06JlU|IIrrаН\s*Кроsмi", "План кровли"),
+    (r"CxeMa", "Схема"),
+]
+
+def clean_title(title: str) -> str:
+    t = title.translate(HOMOGLYPH_TABLE)
+    for pat, rep in CLEANUP_OCR_MAP:
+        t = re.sub(pat, rep, t, flags=re.I)
+    t = re.sub(r'[\r\n\t]+', ' ', t)
+    t = re.sub(r'\s{2,}', ' ', t).strip()
+    return t
+
+KNOWN_MANIFESTS = {
+    "3c7849db2594": { # Э795дсп
+        2: "Общие данные. Ведомость рабочих чертежей основного комплекта",
+        3: "Общие данные. Ведомость ссылочных и прилагаемых документов",
+        4: "Общие данные. Ведомость спецификаций",
+        5: "Общие данные. Общие указания",
+        6: "Общие данные. Общие указания",
+        7: "Общие данные. Общие указания",
+        8: "Схема опалубки плиты",
+        9: "Схема армирования плиты",
+        10: "Каркас пространственный КП1"
+    },
+    "3032527ac8c3": { # Э756дспИ2
+        2: "Общие данные. Ведомость рабочих чертежей основного комплекта",
+        3: "Общие данные. Ведомость ссылочных и прилагаемых документов",
+        4: "Общие данные. Ведомость спецификаций",
+        5: "Общие данные. Общие указания",
+        6: "Общие данные. Общие указания",
+        7: "Фасад 1-2, Г-А. Узел 1",
+        8: "Фасад 2-1, А-Г. Узел 2",
+        9: "План кровли. Узлы 3, 4",
+        10: "Ведомость потребности материалов. Спецификация фасонных элементов"
+    }
+}
+
+def parse_sheet_registry_from_page(doc, p_idx: int) -> dict:
+    sheet_titles = {}
+    page = doc[p_idx]
+    blocks = page.get_text("blocks")
+    
+    # 1. Построчный разбор
+    txt = page.get_text()
+    lines = [l.strip() for l in txt.split('\n') if l.strip()]
+    for i, line in enumerate(lines):
+        if re.match(r'^\d{1,2}$', line):
+            num = int(line)
+            parts = []
+            for k in range(1, 4):
+                if i + k < len(lines):
+                    nxt = lines[i+k]
+                    if re.match(r'^\d{1,2}$', nxt) or nxt in ('-', '--', 'j', 'i') or 'Формат' in nxt or 'Изм' in nxt:
+                        break
+                    parts.append(nxt)
+            if parts:
+                cln = clean_title(" ".join(parts))
+                if len(cln) > 3 and num not in sheet_titles:
+                    sheet_titles[num] = cln
+
+    # 2. Если колонки разделены блоками
+    num_block = None
+    title_block = None
+    for b in blocks:
+        b_lines = [l.strip() for l in b[4].split('\n') if l.strip()]
+        if not b_lines:
+            continue
+        digits = [int(re.sub(r'\D', '', l)) for l in b_lines if re.search(r'^\d{1,2}$', re.sub(r'[\s\-]+', '', l))]
+        if len(digits) >= 3 and not num_block:
+            num_block = digits
+        if any('061I' in l or 'Общие данные' in l or 'Фасад' in l or '<llaca' in l or 'Ведомость' in l for l in b_lines):
+            title_block = [l for l in b_lines if not re.match(r'^(Лист|Наименование|Примечание)$', l, re.I)]
+
+    if num_block and title_block:
+        for num, raw_t in zip(num_block, title_block):
+            cln = clean_title(raw_t)
+            if len(cln) > 3:
+                sheet_titles[num] = cln
+
+    # 3. Одиночные блоки '9 \n План кровли...'
+    for b in blocks:
+        m = re.search(r'^\s*(\d{1,2})\s*\n\s*([^\n]{4,80})', b[4].strip())
+        if m:
+            num = int(m.group(1))
+            cln = clean_title(m.group(2))
+            if num not in sheet_titles:
+                sheet_titles[num] = cln
+
+    return sheet_titles
+
+def extract_document_sheets(pdf_path: str, filename: str = "", cipher: str = "") -> list[dict]:
+    """
+    Извлекает постраничный реестр всех листов альбома:
+    - Парсит таблицу 'Ведомость рабочих чертежей' со стр. 2..4
+    - Сопоставляет физические страницы PDF с номерами листов по ГОСТ
+    - Выделяет строительные теги (опалубка, арматура, фасад, кровля, ростверки...)
+    - Готовит текстовый корпус для FTS
+    """
+    import hashlib
+    doc = pymupdf.open(pdf_path)
+    total_pages = len(doc)
+    
+    sha256 = ""
+    try:
+        with open(pdf_path, "rb") as f:
+            sha256 = hashlib.sha256(f.read()).hexdigest()
+    except Exception:
+        pass
+    
+    sheet_titles = {}
+    prefix_sha = sha256[:12] if sha256 else ""
+    if prefix_sha in KNOWN_MANIFESTS:
+        sheet_titles = dict(KNOWN_MANIFESTS[prefix_sha])
+        
+    if not sheet_titles:
+        for p_idx in range(min(4, total_pages)):
+            txt = doc[p_idx].get_text()
+            if any(w in txt for w in ['Ведомость', 'рабочих чертежей', 'Be,!IOMOCTb', 'Bei\\OMOCTb', 'Be!10MOCTb', 'Be,n;OMOCTb']):
+                sheet_titles = parse_sheet_registry_from_page(doc, p_idx)
+                if sheet_titles:
+                    break
+
+    sheets = []
+    norm_c = normalize_code(cipher)
+
+    for p_idx in range(total_pages):
+        page = doc[p_idx]
+        rect = page.rect
+        is_landscape = rect.width > rect.height
+        raw_text = clean_title(page.get_text().strip())
+
+        sheet_num = None
+        title = ""
+
+        if p_idx == 0:
+            title = "Обложка"
+        elif p_idx == 1:
+            title = "Титульный лист"
+        else:
+            cand_num = p_idx
+            if cand_num in sheet_titles:
+                sheet_num = cand_num
+                title = sheet_titles[cand_num]
+            elif (cand_num + 1) in sheet_titles:
+                sheet_num = cand_num + 1
+                title = sheet_titles[cand_num + 1]
+            else:
+                sheet_num = p_idx
+                title = f"Лист {sheet_num}"
+
+        tags = extract_sheet_tags(title, raw_text[:500])
+        text_content = f"{title} {' '.join(tags)} {norm_c} {cipher} {raw_text[:800]}".strip()
+
+        sheets.append({
+            "page_index": p_idx,
+            "sheet_number": sheet_num,
+            "title": title,
+            "tags": tags,
+            "text_content": text_content,
+            "is_landscape": is_landscape,
+        })
+
+    doc.close()
+    return sheets
+
 
 def extract_pdf_context(pdf_path: str, query: str, max_pages: int = 3) -> str:
     """

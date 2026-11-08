@@ -1,5 +1,6 @@
 import asyncpg
 import os
+import re
 import json
 import secrets
 from dataclasses import dataclass
@@ -27,8 +28,11 @@ class Database:
     async def connect(self):
         self.pool = await asyncpg.create_pool(DATABASE_URL)
         async with self.pool.acquire() as conn:
-            # Создаём таблицу pending_uploads если её нет
+            # Создаём расширения и таблицы
             await conn.execute("""
+                CREATE EXTENSION IF NOT EXISTS "pg_trgm";
+                CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+
                 CREATE TABLE IF NOT EXISTS pending_uploads (
                     tg_id BIGINT PRIMARY KEY,
                     project_code VARCHAR(50) NOT NULL,
@@ -39,23 +43,53 @@ class Database:
                     file_path TEXT NOT NULL,
                     sha256 VARCHAR(64) NOT NULL,
                     created_at TIMESTAMPTZ DEFAULT NOW()
-                )
+                );
+
+                CREATE TABLE IF NOT EXISTS doc_sheets (
+                    id SERIAL PRIMARY KEY,
+                    doc_id INT REFERENCES documents(id) ON DELETE CASCADE,
+                    page_index INT NOT NULL,
+                    sheet_number INT,
+                    title TEXT NOT NULL,
+                    tags TEXT[] DEFAULT '{}',
+                    text_content TEXT DEFAULT '',
+                    tsv tsvector,
+                    is_landscape BOOLEAN DEFAULT TRUE,
+                    created_at TIMESTAMPTZ DEFAULT NOW(),
+                    UNIQUE (doc_id, page_index)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_doc_sheets_lookup ON doc_sheets(doc_id, page_index);
+                CREATE INDEX IF NOT EXISTS idx_doc_sheets_tsv ON doc_sheets USING gin(tsv);
+                CREATE INDEX IF NOT EXISTS idx_doc_sheets_title_trgm ON doc_sheets USING gin(title gin_trgm_ops);
+                CREATE INDEX IF NOT EXISTS idx_documents_code_trgm ON documents USING gin(code gin_trgm_ops);
             """)
 
-    async def ensure_admin(self, tg_id: int):
+    async def ensure_whitelist_user(self, tg_id: int, full_name: str = "Инженер") -> dict:
+        """Регистрирует/обновляет пользователя из белого списка с полным доступом (admin, L2)."""
         async with self.pool.acquire() as conn:
-            await conn.execute("""
-                INSERT INTO users (tg_id, full_name, role, max_clearance)
-                VALUES ($1, 'Главный Инженер (Admin)', 'admin', 'L2')
-                ON CONFLICT (tg_id) DO UPDATE SET max_clearance = 'L2', role = 'admin'
-            """, tg_id)
-            # Привязываем админа ко всем объектам без ограничения по разделам
+            row = await conn.fetchrow("""
+                INSERT INTO users (tg_id, full_name, role, max_clearance, is_active)
+                VALUES ($1, $2, 'admin', 'L2', TRUE)
+                ON CONFLICT (tg_id) DO UPDATE SET 
+                    role = 'admin',
+                    max_clearance = 'L2',
+                    is_active = TRUE
+                RETURNING *
+            """, tg_id, full_name or "Инженер")
+            user = dict(row)
+            # Привязываем ко всем имеющимся объектам с полным доступом
             await conn.execute("""
                 INSERT INTO user_projects (user_id, project_id, project_role, allowed_sections)
-                SELECT u.id, p.id, 'admin', '{}' FROM users u CROSS JOIN projects p
-                WHERE u.tg_id = $1
-                ON CONFLICT (user_id, project_id) DO NOTHING
-            """, tg_id)
+                SELECT $1, p.id, 'admin', '{}' FROM projects p
+                ON CONFLICT (user_id, project_id) DO UPDATE SET
+                    project_role = 'admin',
+                    allowed_sections = '{}'
+            """, user["id"])
+            return user
+
+    async def ensure_admin(self, tg_id: int):
+        return await self.ensure_whitelist_user(tg_id, "Главный Инженер (Admin)")
 
     async def get_user(self, tg_id: int) -> dict | None:
         async with self.pool.acquire() as conn:
@@ -217,33 +251,36 @@ class Database:
         query_code: str = None, project_code: str = None
     ) -> dict | None:
         """
-        ЖЕСТКИЙ ФИЛЬТР ПРАВ И СТРОГАЯ ВЫДАЧА ТОЛЬКО status = 'active':
-        Проверяет привязку к объекту, допуск по грифу, секции и возвращает 
-        ИСКЛЮЧИТЕЛЬНО последнюю активную ревизию с сортировкой по revision DESC.
+        ФИЛЬТР ПРАВ И СТРОГАЯ ВЫДАЧА ТОЛЬКО status = 'active':
+        Для белого списка / admin — полный доступ ко всем объектам и грифам (L0..L2).
+        Для остальных — проверка допуска по грифу и связки с проектом.
         """
-        allowed_levels = [
-            lvl for lvl, rank in CLEARANCE_ORDER.items()
-            if rank <= CLEARANCE_ORDER.get(user["max_clearance"], 0)
-        ]
+        is_admin = (user.get("role") == "admin")
+        if is_admin:
+            allowed_levels = ["L0", "L1", "L2"]
+        else:
+            allowed_levels = [
+                lvl for lvl, rank in CLEARANCE_ORDER.items()
+                if rank <= CLEARANCE_ORDER.get(user.get("max_clearance", "L0"), 0)
+            ]
         async with self.pool.acquire() as conn:
             query = """
                 SELECT d.*, p.code as project_code, up.allowed_sections
                 FROM documents d
                 JOIN projects p ON d.project_id = p.id
-                JOIN user_projects up ON up.project_id = p.id
-                WHERE up.user_id = $1
-                  AND d.status = 'active'
+                LEFT JOIN user_projects up ON up.project_id = p.id AND up.user_id = $1
+                WHERE d.status = 'active'
                   AND d.security_level = ANY($2::varchar[])
+                  AND ($7::boolean OR (up.user_id IS NOT NULL AND (cardinality(up.allowed_sections) = 0 OR d.section = ANY(up.allowed_sections))))
                   AND ($3::varchar IS NULL OR d.doc_type ILIKE $3)
                   AND ($4::varchar IS NULL OR d.section ILIKE $4)
                   AND ($5::varchar IS NULL OR d.code ILIKE '%' || $5 || '%')
                   AND ($6::varchar IS NULL OR p.code ILIKE $6)
-                  AND (cardinality(up.allowed_sections) = 0 OR d.section = ANY(up.allowed_sections))
                 ORDER BY d.revision DESC, d.created_at DESC
                 LIMIT 1
             """
             row = await conn.fetchrow(
-                query, user["id"], allowed_levels, doc_type, section, query_code, project_code
+                query, user["id"], allowed_levels, doc_type, section, query_code, project_code, is_admin
             )
             return dict(row) if row else None
 
@@ -251,51 +288,194 @@ class Database:
         self, user: dict, doc_type: str = None, section: str = None,
         query_code: str = None, project_code: str = None
     ) -> list[dict]:
-        """Как find_active_doc_with_acl, но возвращает ВСЕ активные документы (для мульти-комплектного контекста)."""
-        allowed_levels = [
-            lvl for lvl, rank in CLEARANCE_ORDER.items()
-            if rank <= CLEARANCE_ORDER.get(user["max_clearance"], 0)
-        ]
+        """Возвращает ВСЕ активные документы с учетом ACL (или все для admin)."""
+        is_admin = (user.get("role") == "admin")
+        if is_admin:
+            allowed_levels = ["L0", "L1", "L2"]
+        else:
+            allowed_levels = [
+                lvl for lvl, rank in CLEARANCE_ORDER.items()
+                if rank <= CLEARANCE_ORDER.get(user.get("max_clearance", "L0"), 0)
+            ]
         async with self.pool.acquire() as conn:
             query = """
                 SELECT d.*, p.code as project_code, up.allowed_sections
                 FROM documents d
                 JOIN projects p ON d.project_id = p.id
-                JOIN user_projects up ON up.project_id = p.id
-                WHERE up.user_id = $1
-                  AND d.status = 'active'
+                LEFT JOIN user_projects up ON up.project_id = p.id AND up.user_id = $1
+                WHERE d.status = 'active'
                   AND d.security_level = ANY($2::varchar[])
+                  AND ($7::boolean OR (up.user_id IS NOT NULL AND (cardinality(up.allowed_sections) = 0 OR d.section = ANY(up.allowed_sections))))
                   AND ($3::varchar IS NULL OR d.doc_type ILIKE $3)
                   AND ($4::varchar IS NULL OR d.section ILIKE $4)
                   AND ($5::varchar IS NULL OR d.code ILIKE '%' || $5 || '%')
                   AND ($6::varchar IS NULL OR p.code ILIKE $6)
-                  AND (cardinality(up.allowed_sections) = 0 OR d.section = ANY(up.allowed_sections))
                 ORDER BY d.revision DESC, d.created_at DESC
             """
             rows = await conn.fetch(
-                query, user["id"], allowed_levels, doc_type, section, query_code, project_code
+                query, user["id"], allowed_levels, doc_type, section, query_code, project_code, is_admin
             )
             return [dict(r) for r in rows]
 
     async def list_available_docs_summary(self, user: dict) -> list[dict]:
         """Возвращает список доступных пользователю активных документов по проектам."""
-        allowed_levels = [
-            lvl for lvl, rank in CLEARANCE_ORDER.items()
-            if rank <= CLEARANCE_ORDER.get(user["max_clearance"], 0)
-        ]
+        is_admin = (user.get("role") == "admin")
+        if is_admin:
+            allowed_levels = ["L0", "L1", "L2"]
+        else:
+            allowed_levels = [
+                lvl for lvl, rank in CLEARANCE_ORDER.items()
+                if rank <= CLEARANCE_ORDER.get(user.get("max_clearance", "L0"), 0)
+            ]
         async with self.pool.acquire() as conn:
             query = """
                 SELECT p.code as project_code, d.code as doc_code, d.section, d.revision
                 FROM documents d
                 JOIN projects p ON d.project_id = p.id
-                JOIN user_projects up ON up.project_id = p.id
-                WHERE up.user_id = $1
-                  AND d.status = 'active'
+                LEFT JOIN user_projects up ON up.project_id = p.id AND up.user_id = $1
+                WHERE d.status = 'active'
                   AND d.security_level = ANY($2::varchar[])
+                  AND ($3::boolean OR up.user_id IS NOT NULL)
                 ORDER BY p.code, d.section, d.code
             """
-            rows = await conn.fetch(query, user["id"], allowed_levels)
+            rows = await conn.fetch(query, user["id"], allowed_levels, is_admin)
             return [dict(r) for r in rows]
+
+    async def index_document_sheets(self, doc_id: int, sheets: list[dict]):
+        """
+        Сохраняет/обновляет постраничный реестр листов чертежей в doc_sheets.
+        Генерирует tsvector полнотекстового поиска с весами:
+        'A' - заголовок листа (title)
+        'B' - теги листа (tags)
+        'C' - текстовый контент листа (text_content)
+        """
+        async with self.pool.acquire() as conn:
+            for s in sheets:
+                tags = s.get("tags") or []
+                text_content = s.get("text_content") or ""
+                title = s.get("title") or ""
+                sheet_number = s.get("sheet_number")
+                page_index = s["page_index"]
+                is_landscape = s.get("is_landscape", True)
+
+                await conn.execute("""
+                    INSERT INTO doc_sheets (
+                        doc_id, page_index, sheet_number, title, tags, text_content, tsv, is_landscape
+                    )
+                    VALUES (
+                        $1, $2, $3, $4, $5, $6,
+                        setweight(to_tsvector('russian', coalesce($4, '')), 'A') ||
+                        setweight(to_tsvector('russian', array_to_string($5::text[], ' ')), 'B') ||
+                        setweight(to_tsvector('russian', coalesce($6, '')), 'C'),
+                        $7
+                    )
+                    ON CONFLICT (doc_id, page_index) DO UPDATE SET
+                        sheet_number = EXCLUDED.sheet_number,
+                        title = EXCLUDED.title,
+                        tags = EXCLUDED.tags,
+                        text_content = EXCLUDED.text_content,
+                        tsv = setweight(to_tsvector('russian', coalesce(EXCLUDED.title, '')), 'A') ||
+                              setweight(to_tsvector('russian', array_to_string(EXCLUDED.tags, ' ')), 'B') ||
+                              setweight(to_tsvector('russian', coalesce(EXCLUDED.text_content, '')), 'C'),
+                        is_landscape = EXCLUDED.is_landscape
+                """, doc_id, page_index, sheet_number, title, tags, text_content, is_landscape)
+
+    async def search_sheets_fts(
+        self, user: dict, query: str, project_code: str = None, section: str = None
+    ) -> dict | None:
+        """
+        Мгновенный поиск листа через полнотекстовый индекс tsvector + pg_trgm.
+        Возвращает самый релевантный лист за 1-2 мс без вызова нейросетей.
+        """
+        stop_words = {
+            'дай', 'где', 'как', 'что', 'это', 'какая', 'какой', 'скажи', 
+            'покажи', 'по', 'нему', 'для', 'или', 'на', 'есть', 'ли', 'мне',
+            'пожалуйста', 'скинь', 'выдай', 'нужен', 'нужна', 'нужны', 'чертеж', 'чертежи'
+        }
+        tokens = [w for w in re.findall(r'[а-яa-z0-9]{2,}', query, re.I) if w.lower() not in stop_words]
+        if not tokens:
+            return None
+        
+        clean_q = " ".join(tokens)
+        query_tokens = [w.lower() for w in tokens]
+
+        is_admin = (user.get("role") == "admin")
+        allowed_levels = ["L0", "L1", "L2"] if is_admin else [
+            lvl for lvl, rank in CLEARANCE_ORDER.items()
+            if rank <= CLEARANCE_ORDER.get(user.get("max_clearance", "L0"), 0)
+        ]
+
+        async with self.pool.acquire() as conn:
+            sql = """
+                SELECT ds.*, d.code as doc_code, d.revision, d.section, d.file_path, d.security_level,
+                       p.code as project_code,
+                       ts_rank(ds.tsv, plainto_tsquery('russian', $1)) as rank,
+                       similarity(ds.title, $1) as sim
+                FROM doc_sheets ds
+                JOIN documents d ON ds.doc_id = d.id
+                JOIN projects p ON d.project_id = p.id
+                WHERE d.status = 'active'
+                  AND d.security_level = ANY($2::varchar[])
+                  AND ($3::varchar IS NULL OR p.code ILIKE $3)
+                  AND ($4::varchar IS NULL OR d.section ILIKE $4)
+                  AND (
+                      ds.tsv @@ plainto_tsquery('russian', $1)
+                      OR ds.title ILIKE '%' || $1 || '%'
+                      OR ds.tags && $5::text[]
+                      OR similarity(ds.title, $1) > 0.15
+                  )
+                ORDER BY rank DESC, sim DESC, ds.sheet_number ASC
+                LIMIT 1
+            """
+            row = await conn.fetchrow(sql, clean_q, allowed_levels, project_code, section, query_tokens)
+            return dict(row) if row else None
+
+    async def get_project_sheets_map(self, user: dict, project_code: str = None) -> str:
+        """
+        Формирует структурированную текстовую карту доступных комплектов и листов (per-user, post-ACL).
+        Занимает всего 1-3 тыс. токенов и передается в LLM как компактная карта проекта.
+        """
+        docs = await self.list_active_docs_with_acl(user, project_code=project_code)
+        if not docs:
+            return "В реестре нет доступных активных документов по данному запросу."
+
+        doc_ids = [d["id"] for d in docs]
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT doc_id, page_index, sheet_number, title, tags
+                FROM doc_sheets
+                WHERE doc_id = ANY($1::int[])
+                ORDER BY doc_id, page_index ASC
+            """, doc_ids)
+
+        sheets_by_doc = {}
+        for r in rows:
+            sheets_by_doc.setdefault(r["doc_id"], []).append(dict(r))
+
+        by_proj = {}
+        for d in docs:
+            by_proj.setdefault(d["project_code"], []).append(d)
+
+        lines = ["=== КАРТА ПРОЕКТА (РЕЕСТР ДОСТУПНЫХ ЛИСТОВ) ==="]
+        for p_code, p_docs in by_proj.items():
+            lines.append(f"\n🏗️ Объект: {p_code}")
+            for d in p_docs:
+                d_sheets = sheets_by_doc.get(d["id"], [])
+                sec_lvl = d.get("security_level", "L0")
+                lines.append(
+                    f"  📄 Комплект [{d['code']}] (Раздел {d['section']}, Изм. {d['revision']}, Гриф {sec_lvl}):"
+                )
+                if not d_sheets:
+                    lines.append("     (состав листов не индексирован)")
+                else:
+                    for s in d_sheets:
+                        sh_num = s["sheet_number"]
+                        sh_str = f"Лист {sh_num}" if sh_num else f"Стр. {s['page_index'] + 1}"
+                        p_idx = s["page_index"] + 1
+                        tags_str = f" [{', '.join(s['tags'])}]" if s.get("tags") else ""
+                        lines.append(f"     • {sh_str} (PDF-стр. {p_idx}): {s['title']}{tags_str}")
+
+        return "\n".join(lines)
 
     async def save_pending_upload(self, tg_id: int, upload: PendingUpload):
         """Сохраняет черновик загрузки в БД (UPSERT)."""
