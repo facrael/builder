@@ -862,9 +862,23 @@ async def cmd_ask_hermes(message: Message):
     # 3. Fallback на лист, ранее найденный быстрым FTS-индексом
     if target_idx is None and target_sheet and not is_refusal:
         t_path = target_sheet.get("file_path")
+        t_idx = target_sheet["page_index"]
         if t_path and os.path.exists(t_path):
-            target_idx = target_sheet["page_index"]
+            target_idx = t_idx
             pdf_path = t_path
+            # doc_sheets.page_index может быть сдвинут титульным листом — сверяем
+            # со штампом: реальную страницу ищем по номеру листа + названию.
+            t_sheet_no = target_sheet.get("sheet_number")
+            if t_sheet_no:
+                try:
+                    verified = find_sheet_page(
+                        t_path, int(t_sheet_no),
+                        expect=target_sheet.get("title") or ""
+                    )
+                    if verified:
+                        target_idx = verified - 1
+                except Exception as _e:
+                    print(f"[fts stamp verify] {_e}", flush=True)
             send_doc = {
                 "code": target_sheet["doc_code"],
                 "revision": target_sheet["revision"],
