@@ -1023,7 +1023,7 @@ async def auto_index_documents(user: dict = None) -> str:
             print(f"[auto_index new file error] {e}", flush=True)
 
     summary = (
-        f"📋 **Результаты индексации реестра чертежей:**\n\n" +
+        "📋 **Результаты индексации реестра чертежей:**\n\n" +
         ("\n".join(report_lines) if report_lines else "Документов для индексации не обнаружено.") +
         "\n\nВсего проиндексировано листов: **" + str(total_indexed) + "**.\n"
         "Быстрый FTS-поиск и карта проектов активны!"
