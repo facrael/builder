@@ -928,6 +928,114 @@ async def cmd_ask_hermes(message: Message):
         final_text = (detail or "").strip() or clean_answer
         await message.answer(final_text[:4000])
 
+async def auto_index_documents(user: dict = None) -> str:
+    """
+    Автоматическая индексация всех документов в doc_sheets:
+    1. Находит все активные документы в БД.
+    2. Проверяет наличие листов в doc_sheets.
+    3. Если листы отсутствуют или требуется обновление — извлекает и индексирует.
+    4. Также сканирует STORAGE_DIR на наличие нераспознанных PDF.
+    """
+    if not user:
+        user = {"id": 1, "role": "admin", "max_clearance": "L2"}
+
+    docs = await db.list_active_docs_with_acl(user)
+    report_lines = []
+    total_indexed = 0
+
+    # 1. Индексация документов из БД
+    for doc in docs:
+        doc_id = doc["id"]
+        file_path = doc.get("file_path")
+        code = doc["code"]
+        proj = doc.get("project_code", "")
+
+        actual_path = None
+        if file_path and os.path.exists(file_path):
+            actual_path = file_path
+        else:
+            fname = Path(file_path).name if file_path else f"{code}.pdf"
+            candidate = STORAGE_DIR / fname
+            if candidate.exists():
+                actual_path = str(candidate)
+            else:
+                for p in STORAGE_DIR.glob("*.pdf"):
+                    if code.lower() in p.name.lower() or (proj and proj.lower() in p.name.lower()):
+                        actual_path = str(p)
+                        break
+
+        if not actual_path:
+            report_lines.append(f"⚠️ `{code}` ({proj}): файл чертежа не найден на диске")
+            continue
+
+        try:
+            sheets = extract_document_sheets(actual_path, filename=code, cipher=code)
+            if sheets:
+                await db.index_document_sheets(doc_id, sheets)
+                total_indexed += len(sheets)
+                report_lines.append(f"✅ `{code}` ({proj}): проиндексировано **{len(sheets)}** листов")
+            else:
+                report_lines.append(f"⚠️ `{code}` ({proj}): листы не распознаны")
+        except Exception as e:
+            report_lines.append(f"❌ `{code}` ({proj}): ошибка индексации: {e}")
+
+    # 2. Проверяем также файлы в STORAGE_DIR, которые еще не зарегистрированы
+    existing_paths = {d.get("file_path") for d in docs if d.get("file_path")}
+    existing_codes = {d["code"].lower() for d in docs}
+
+    for pdf_file in STORAGE_DIR.glob("*.pdf"):
+        if str(pdf_file) in existing_paths or pdf_file.stem.lower() in existing_codes:
+            continue
+        try:
+            from pdf_engine import extract_gost_stamp_info
+            stamp = extract_gost_stamp_info(str(pdf_file), filename=pdf_file.name)
+            p_code = stamp.get("suggested_project") or "ОБЪЕКТ-1"
+            sec = stamp.get("detected_section") or "КР"
+            c_code = stamp.get("detected_code") or pdf_file.stem
+            s_lvl = stamp.get("suggested_sec_level") or "L0"
+            sha256_hash = hashlib.sha256(pdf_file.read_bytes()).hexdigest()
+
+            new_d = await db.register_new_revision(
+                project_code=p_code,
+                doc_type="РД",
+                section=sec,
+                code=c_code,
+                sec_level=s_lvl,
+                file_path=str(pdf_file),
+                sha256=sha256_hash,
+                user_id=user["id"]
+            )
+            if not (isinstance(new_d, dict) and new_d.get("duplicate")):
+                sheets = extract_document_sheets(str(pdf_file), filename=c_code, cipher=c_code)
+                if sheets:
+                    await db.index_document_sheets(new_d["id"], sheets)
+                    total_indexed += len(sheets)
+                report_lines.append(f"🆕 `{c_code}` ({p_code}): зарегистрирован и проиндексирован ({len(sheets)} листов)")
+        except Exception as e:
+            print(f"[auto_index new file error] {e}", flush=True)
+
+    summary = (
+        f"📋 **Результаты индексации реестра чертежей:**\n\n" +
+        ("\n".join(report_lines) if report_lines else "Документов для индексации не обнаружено.") +
+        f"\n\nВсего проиндексировано листов: **{total_indexed}**.\n"
+        f"Быстрый FTS-поиск и карта проектов активны!"
+    )
+    return summary
+
+
+@dp.message(Command("index"))
+@dp.message(Command("reindex"))
+async def cmd_index(message: Message):
+    """Ручной запуск индексации всех чертежей пользователем из белого списка."""
+    status_msg = await message.answer("⏳ Запускаю сканирование и индексацию листов чертежей...")
+    try:
+        user = await db.get_user(message.from_user.id)
+        report = await auto_index_documents(user)
+        await status_msg.edit_text(report)
+    except Exception as e:
+        await status_msg.edit_text(f"❌ Ошибка индексации: {e}")
+
+
 # Catch-all: любой свободный текст (не команда, не документ) — как вопрос в LLM.
 # Регистрируется последним, поэтому команды и документы обрабатываются раньше.
 @dp.message(F.text, ~F.text.startswith("/"))
@@ -943,6 +1051,15 @@ async def main():
 
     if ADMIN_TG_ID:
         await db.ensure_admin(ADMIN_TG_ID)
+
+    # Автоматическая индексация чертежей при старте бота
+    try:
+        print("🔍 Запуск автоматической индексации листов чертежей...", flush=True)
+        res = await auto_index_documents()
+        print(f"✅ Результаты авто-индексации:\n{res}", flush=True)
+    except Exception as e:
+        print(f"⚠️ Ошибка авто-индексации при старте: {e}", flush=True)
+
     print("🚀 Бот строительного реестра запущен...")
     await dp.start_polling(bot)
 
