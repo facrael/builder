@@ -675,22 +675,43 @@ def render_full_sheet(
     doc = pymupdf.open(pdf_path)
     page = doc[page_index]
 
-    # Полный лист: CropBox у сканов часто уже MediaBox (правая часть со штампом
-    # отрезается). Рендерим по MediaBox, CropBox игнорируем.
-    mb = page.mediabox
-    page_w, page_h = mb.width, mb.height
+    # Полный лист: CropBox у сканов бывает уже MediaBox — расширяем до полного.
+    try:
+        page.set_cropbox(page.mediabox)
+    except Exception:
+        pass
 
     # Лимит Telegram: сторона фото <= 10000 px и соотношение сторон <= 20.
-    # Ограничиваем dpi так, чтобы длинная сторона не превышала 8000 px.
-    max_side_pt = max(page_w, page_h)
+    max_side_pt = max(page.rect.width, page.rect.height)
     max_dpi = int(8000 * 72.0 / max_side_pt)
     dpi = min(dpi, max(72, max_dpi))
 
-    # Создаем копию страницы для нанесения водяного знака
+    # get_pixmap учитывает /Rotate страницы — ориентация правильная.
+    pix = page.get_pixmap(dpi=dpi)
+
+    # Автоповорот для сканов БЕЗ /Rotate: альбомный скан вложен в портретную
+    # страницу. Если результат портретный, а внутри лежит альбомная картинка —
+    # разворачиваем растр на 90° по часовой (штамп уходит вниз, как в ГОСТ).
+    try:
+        if pix.height > pix.width:
+            img_sizes = [doc.extract_image(x[0]) for x in page.get_images(full=True)]
+            if any(im and im["width"] > im["height"] * 1.15 for im in img_sizes):
+                import io as _io
+                from PIL import Image as _PILImage
+                img = _PILImage.open(_io.BytesIO(pix.tobytes("png")))
+                img = img.transpose(_PILImage.Transpose.ROTATE_270)  # 90° по часовой
+                buf = _io.BytesIO()
+                img.save(buf, format="png")
+                pix = pymupdf.Pixmap(png=buf.getvalue())
+    except Exception as rot_err:
+        print(f"[render rotate] {rot_err}", flush=True)
+
+    # Водяной знак наносим на свежую страницу того же размера, куда вставлен
+    # готовый растр (show_pdf_page не respect-ит /Rotate — потому растр).
+    scale = 72.0 / dpi
     temp_doc = pymupdf.open()
-    temp_page = temp_doc.new_page(width=page_w, height=page_h)
-    clip = pymupdf.Rect(0, 0, page_w, page_h)
-    temp_page.show_pdf_page(temp_page.rect, doc, page_index, clip=clip)
+    temp_page = temp_doc.new_page(width=pix.width * scale, height=pix.height * scale)
+    temp_page.insert_image(temp_page.rect, pixmap=pix)
 
     watermark_text = (
         f"АКТУАЛЬНО | {doc_meta} | PDF-стр. {page_index + 1} (номер листа сверяйте по штампу)\n"
@@ -698,38 +719,18 @@ def render_full_sheet(
     )
     _insert_cyrillic_textbox(
         temp_page,
-        pymupdf.Rect(20, 15, page.rect.width - 20, 60),
+        pymupdf.Rect(20, 15, temp_page.rect.width - 20, 60),
         watermark_text,
         fontsize=10,
         color=(0.8, 0.1, 0.1),
     )
 
     out_path = f"{pdf_path}_sheet_{page_index + 1}.png"
-    pix = temp_page.get_pixmap(dpi=dpi)
-    pix.save(out_path)
+    final_pix = temp_page.get_pixmap(dpi=72)
+    final_pix.save(out_path)
 
     temp_doc.close()
     doc.close()
-
-    # Автоповорот: скан-альбом вложен в портретную страницу A4 без /Rotate.
-    # Если страница портретная, а вложенная растровая картинка альбомная —
-    # разворачиваем PNG на 90° по часовой (штамп уходит вниз, как в ГОСТ).
-    try:
-        if page_h > page_w:
-            doc2 = pymupdf.open(pdf_path)
-            pg = doc2[page_index]
-            img_sizes = [doc2.extract_image(x[0]) for x in pg.get_images(full=True)]
-            doc2.close()
-            for im in img_sizes:
-                if im and im["width"] > im["height"] * 1.15:
-                    from PIL import Image as _PILImage
-                    img = _PILImage.open(out_path)
-                    img = img.transpose(_PILImage.Transpose.ROTATE_270)  # 90° по часовой
-                    img.save(out_path)
-                    break
-    except Exception as rot_err:
-        print(f"[render rotate] {rot_err}", flush=True)
-
     return out_path
 
 
