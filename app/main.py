@@ -419,6 +419,17 @@ async def cancel_upload(call: CallbackQuery):
         await call.message.edit_text("❌ Загрузка документа отменена пользователем.")
 
 
+def _strip_md(text: str) -> str:
+    """Убираем markdown-разметку (**жирный**, *курсив*, `код`) — Telegram-чат
+    получает plain text без parse_mode, звёзды в сыром виде смотреть не надо."""
+    if not text:
+        return text
+    text = re.sub(r"\*\*(.+?)\*\*", r"\1", text, flags=re.S)
+    text = re.sub(r"(?<!\*)\*(?!\s)([^*\n]+?)\*(?!\*)", r"\1", text)
+    text = re.sub(r"`{1,3}([^`]*)`{1,3}", r"\1", text)
+    return text
+
+
 def _expect_phrase(question: str) -> str:
     """Короткое имя запрошенной конструкции для сверки содержимого листа."""
     m = re.search(r"(ростверк|фундамент|схема|план|фасад|узел|разрез|опалубка|армирование)\s*[а-яё]*\s*[а-яА-ЯР0-9.,\-]{0,12}", question.lower())
@@ -874,7 +885,7 @@ async def cmd_ask_hermes(message: Message):
 
     if target_idx is None or not pdf_path or not os.path.exists(pdf_path):
         # Лист не найден (или отказ) — сразу отдаём текстовый ответ, ничего не ждём.
-        await message.answer(clean_answer)
+        await message.answer(_strip_md(clean_answer))
     else:
         # Лист найден: сначала читаем его (2-я ступень), потом шлём фото + ОДИН сводный ответ.
         detail = ""
@@ -925,7 +936,7 @@ async def cmd_ask_hermes(message: Message):
 
         # Итоговый ответ — один: данные с листа; если чтение сорвалось — первый ответ.
         final_text = (detail or "").strip() or clean_answer
-        await message.answer(final_text[:4000])
+        await message.answer(_strip_md(final_text)[:4000])
 
 async def auto_index_documents(user: dict = None) -> str:
     """

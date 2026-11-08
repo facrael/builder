@@ -392,7 +392,18 @@ class Database:
             'покажи', 'по', 'нему', 'для', 'или', 'на', 'есть', 'ли', 'мне',
             'пожалуйста', 'скинь', 'выдай', 'нужен', 'нужна', 'нужны', 'чертеж', 'чертежи'
         }
-        tokens = [w for w in re.findall(r'[а-яa-z0-9]{2,}', query, re.I) if w.lower() not in stop_words]
+        # Синонимы строительных терминов: крыша -> кровля и т.п.
+        synonyms = {
+            'крыша': 'кровля', 'крышу': 'кровля', 'крыши': 'кровля', 'крышей': 'кровля',
+            'кровле': 'кровля', 'кровлю': 'кровля', 'кровли': 'кровля',
+            'фундаменты': 'фундамент', 'ростверки': 'ростверк',
+            'фасады': 'фасад', 'перекрытия': 'перекрытие', 'сваи': 'свая',
+        }
+        raw_tokens = [w for w in re.findall(r'[а-яa-z0-9]{2,}', query, re.I) if w.lower() not in stop_words]
+        tokens = []
+        for w in raw_tokens:
+            wl = w.lower()
+            tokens.append(synonyms.get(wl, wl))
         if not tokens:
             return None
         
@@ -410,6 +421,7 @@ class Database:
                 SELECT ds.*, d.code as doc_code, d.revision, d.section, d.file_path, d.security_level,
                        p.code as project_code,
                        ts_rank(ds.tsv, plainto_tsquery('russian', $1)) as rank,
+                       ts_rank(to_tsvector('russian', coalesce(ds.title, '')), plainto_tsquery('russian', $1)) as title_rank,
                        similarity(ds.title, $1) as sim
                 FROM doc_sheets ds
                 JOIN documents d ON ds.doc_id = d.id
@@ -424,7 +436,7 @@ class Database:
                       OR ds.tags && $5::text[]
                       OR similarity(ds.title, $1) > 0.15
                   )
-                ORDER BY rank DESC, sim DESC, ds.sheet_number ASC
+                ORDER BY (title_rank * 5 + rank + sim) DESC, ds.sheet_number ASC
                 LIMIT 1
             """
             row = await conn.fetchrow(sql, clean_q, allowed_levels, project_code, section, query_tokens)
