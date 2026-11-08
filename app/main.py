@@ -982,9 +982,19 @@ async def auto_index_documents(user: dict = None) -> str:
     # 2. Проверяем также файлы в STORAGE_DIR, которые еще не зарегистрированы
     existing_paths = {d.get("file_path") for d in docs if d.get("file_path")}
     existing_codes = {d["code"].lower() for d in docs}
+    # НЕ трогаем файлы, ожидающие подтверждения загрузки (pending_uploads):
+    # они попадут в реестр только после нажатия «Подтвердить».
+    try:
+        pending_rows = await db.pool.fetch("SELECT sha256, file_path FROM pending_uploads")
+        pending_hashes = {r["sha256"] for r in pending_rows}
+        pending_paths = {r["file_path"] for r in pending_rows}
+    except Exception:
+        pending_hashes, pending_paths = set(), set()
 
     for pdf_file in STORAGE_DIR.glob("*.pdf"):
         if str(pdf_file) in existing_paths or pdf_file.stem.lower() in existing_codes:
+            continue
+        if str(pdf_file) in pending_paths:
             continue
         try:
             from pdf_engine import extract_gost_stamp_info
