@@ -675,16 +675,22 @@ def render_full_sheet(
     doc = pymupdf.open(pdf_path)
     page = doc[page_index]
 
+    # Полный лист: CropBox у сканов часто уже MediaBox (правая часть со штампом
+    # отрезается). Рендерим по MediaBox, CropBox игнорируем.
+    mb = page.mediabox
+    page_w, page_h = mb.width, mb.height
+
     # Лимит Telegram: сторона фото <= 10000 px и соотношение сторон <= 20.
     # Ограничиваем dpi так, чтобы длинная сторона не превышала 8000 px.
-    max_side_pt = max(page.rect.width, page.rect.height)
+    max_side_pt = max(page_w, page_h)
     max_dpi = int(8000 * 72.0 / max_side_pt)
     dpi = min(dpi, max(72, max_dpi))
 
     # Создаем копию страницы для нанесения водяного знака
     temp_doc = pymupdf.open()
-    temp_page = temp_doc.new_page(width=page.rect.width, height=page.rect.height)
-    temp_page.show_pdf_page(temp_page.rect, doc, page_index)
+    temp_page = temp_doc.new_page(width=page_w, height=page_h)
+    clip = pymupdf.Rect(0, 0, page_w, page_h)
+    temp_page.show_pdf_page(temp_page.rect, doc, page_index, clip=clip)
 
     watermark_text = (
         f"АКТУАЛЬНО | {doc_meta} | PDF-стр. {page_index + 1} (номер листа сверяйте по штампу)\n"
@@ -704,6 +710,26 @@ def render_full_sheet(
 
     temp_doc.close()
     doc.close()
+
+    # Автоповорот: скан-альбом вложен в портретную страницу A4 без /Rotate.
+    # Если страница портретная, а вложенная растровая картинка альбомная —
+    # разворачиваем PNG на 90° по часовой (штамп уходит вниз, как в ГОСТ).
+    try:
+        if page_h > page_w:
+            doc2 = pymupdf.open(pdf_path)
+            pg = doc2[page_index]
+            img_sizes = [doc2.extract_image(x[0]) for x in pg.get_images(full=True)]
+            doc2.close()
+            for im in img_sizes:
+                if im and im["width"] > im["height"] * 1.15:
+                    from PIL import Image as _PILImage
+                    img = _PILImage.open(out_path)
+                    img = img.transpose(_PILImage.Transpose.ROTATE_270)  # 90° по часовой
+                    img.save(out_path)
+                    break
+    except Exception as rot_err:
+        print(f"[render rotate] {rot_err}", flush=True)
+
     return out_path
 
 
