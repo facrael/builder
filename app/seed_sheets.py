@@ -1,9 +1,8 @@
-"""Seed and index script for construction bot (ТЗ v2: З-5).
+"""Seed and index script for construction bot (ТЗ v2).
 
 Requirements:
 - No default hardcoded ADMIN_TG_ID. Fails if not set.
 - No sec_level in manifest.
-- Rejects ДСП files.
 - Indexes sheets into doc_sheets.
 """
 import asyncio
@@ -13,7 +12,7 @@ import sys
 from pathlib import Path
 from config import get_config
 from db import Database
-from pdf_engine import extract_document_sheets, detect_dsp_marker, extract_gost_stamp_info
+from pdf_engine import extract_document_sheets, extract_gost_stamp_info
 from obsidian import sync_document_card
 
 POSSIBLE_DIRS = [
@@ -69,11 +68,6 @@ async def seed():
     for fname in candidate_files:
         fpath = find_file(fname)
         if not fpath:
-            continue
-
-        # Check DSP marker
-        if detect_dsp_marker(str(fpath), filename=fname):
-            print(f"🚫 Файл {fname} содержит маркер ДСП — пропуск согласно политике безопасности.")
             continue
 
         raw_bytes = fpath.read_bytes()

@@ -6,7 +6,7 @@ Enforces:
 - Private chats only (З-12).
 - Unified ACL and Single Delivery Point 'deliver' with repeating diagonal watermark (З-3, З-11).
 - Cloud Guard: zero document bytes to external cloud if cloud_ok=false (З-3).
-- Immediate ДСП file rejection (З-5).
+- Acceptance of all project documents without classification restrictions.
 - Tool calling loop with function calling format (З-9).
 - Active registry /registry with Excel export (З-13).
 - System prompt loaded from app/prompts/AGENT_SYSTEM_PROMPT.md, sha256 logged (З-8).
@@ -41,7 +41,6 @@ from config import get_config, AppConfig
 from db import Database, PendingUpload
 from pdf_engine import (
     extract_gost_stamp_info,
-    detect_dsp_marker,
     render_full_sheet,
     render_drawing_fragment,
     locate_drawing_fragments,
@@ -490,24 +489,6 @@ async def handle_file_upload(message: Message):
 
     file_info = await bot.get_file(doc_file.file_id)
     await bot.download_file(file_info.file_path, destination=temp_path)
-
-    # 1. ДСП REJECTION CHECK (З-5)
-    if detect_dsp_marker(str(temp_path), filename=orig_name):
-        temp_path.unlink(missing_ok=True)
-        await db.log_audit(tg_id, "BLOCKED_UPLOAD", None, {"reason": "DSP_marker_detected", "filename": orig_name})
-        # Alert admin
-        try:
-            await bot.send_message(
-                config.admin_tg_id,
-                f"🚨 <b>Попытка загрузки ДСП файла:</b>\n"
-                f"Пользователь: ID {tg_id} ({message.from_user.full_name})\n"
-                f"Имя файла: <code>{orig_name}</code>\n"
-                f"Файл немедленно отклонён и удалён."
-            )
-        except Exception:
-            pass
-        await message.answer("❌ <b>ДСП в бот не загружается.</b> Документ отклонён политикой безопасности.")
-        return
 
     sha256 = hashlib.sha256(temp_path.read_bytes()).hexdigest()
 

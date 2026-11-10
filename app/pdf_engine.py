@@ -1,7 +1,6 @@
 """PDF rendering, stamp parsing, sheet indexing, and watermark engine (ТЗ v2).
 
 Enforces:
-- Immediate ДСП marker detection (З-5).
 - High DPI raster rendering (150-200 DPI) without 72 DPI downscaling (З-11).
 - Repeating diagonal watermark on every delivered sheet/fragment (З-11).
 - Normalization of codes and homoglyphs (З-17).
