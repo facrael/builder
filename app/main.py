@@ -822,7 +822,13 @@ async def execute_tool(name: str, args: dict, user_tg_id: int) -> dict:
     return {"status": "unknown_tool"}
 
 
-async def run_llm_agent(user_message: str, user_tg_id: int) -> str:
+# Короткая память диалога: chat_id -> список последних сообщений (role/content).
+# Живёт в памяти процесса; длина ограничена, чтобы не раздувать контекст.
+CHAT_HISTORY: dict[int, list[dict]] = {}
+HISTORY_MAX_MSGS = 8  # 4 пары «вопрос-ответ»
+
+
+async def run_llm_agent(user_message: str, user_tg_id: int, chat_id: int | None = None) -> str:
     """Executes multi-turn tool calling loop (max 6 iterations, 120s timeout) (З-9)."""
     # Динамический блок: объекты, доступные ЭТОМУ пользователю (З-4: только свои).
     user_projects = config.get_user_projects(user_tg_id)
@@ -841,9 +847,19 @@ async def run_llm_agent(user_message: str, user_tg_id: int) -> str:
             "project_code именно этим кодом. Переспрашивай, только если объект понять "
             "действительно невозможно."
         )
+    # Короткая память диалога: агент видит предыдущие вопросы и свои ответы,
+    # поэтому «1» / «Схему опалубки плиты» после перечисления понимает как выбор.
+    history = CHAT_HISTORY.get(chat_id, []) if chat_id else []
+    history_note = (
+        "\n\nЭто ПРОДОЛЖЕНИЕ диалога. Короткие ответы пользователя (цифра, «первый», "
+        "название листа/узла) относятся к твоему последнему вопросу — трактуй их как выбор "
+        "варианта, который ты предложил, и сразу выполняй."
+        if history else ""
+    )
     messages = [
         {"role": "system", "content": AGENT_SYSTEM_PROMPT + projects_hint},
-        {"role": "user", "content": f"Вопрос пользователя (Telegram ID {user_tg_id}): {user_message}"}
+    ] + history + [
+        {"role": "user", "content": f"Вопрос пользователя (Telegram ID {user_tg_id}): {user_message}{history_note}"}
     ]
 
     use_openrouter = bool(OPENROUTER_API_KEY)
@@ -911,7 +927,15 @@ async def handle_user_query(message: Message):
     await db.log_audit(tg_id, "AGENT_QUERY", None, {"prompt_sha256": PROMPT_SHA256, "query": text})
 
     try:
-        reply = await run_llm_agent(text, tg_id)
+        chat_id = message.chat.id
+        reply = await run_llm_agent(text, tg_id, chat_id=chat_id)
+        # Память диалога: сохраняем пару вопрос/ответ (только текст, без секретов).
+        if chat_id:
+            hist = CHAT_HISTORY.setdefault(chat_id, [])
+            hist.append({"role": "user", "content": text})
+            hist.append({"role": "assistant", "content": str(reply)[:1500]})
+            while len(hist) > HISTORY_MAX_MSGS:
+                hist.pop(0)
         # Strip raw markdown artifacts for clean messenger delivery
         clean_reply = re.sub(r'```[a-z]*\n|```', '', reply).strip()
         await message.answer(clean_reply)
