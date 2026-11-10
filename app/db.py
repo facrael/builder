@@ -310,7 +310,7 @@ class Database:
                 if config.admin_tg_id and config.admin_tg_id in tg_to_user_id:
                     active_users_in_projects.add(tg_to_user_id[config.admin_tg_id])
 
-                deactivated = await conn.execute("""
+                _ = await conn.execute("""
                     UPDATE users SET is_active = FALSE 
                     WHERE id != ALL($1::int[]) AND is_active = TRUE
                 """, list(active_users_in_projects))

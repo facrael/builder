@@ -6,14 +6,11 @@ Enforces:
 - Normalization of codes and homoglyphs (З-17).
 - Cloud guard for vision models: zero bytes sent if cloud_ok is False (З-3).
 """
-import base64
 import datetime
 import io
-import json
 import logging
 import os
 import re
-import urllib.request
 from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont
 import pymupdf

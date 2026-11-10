@@ -12,6 +12,7 @@ Enforces:
 - System prompt loaded from app/prompts/AGENT_SYSTEM_PROMPT.md, sha256 logged (З-8).
 """
 import asyncio
+import datetime
 import hashlib
 import io
 import json
@@ -45,7 +46,6 @@ from pdf_engine import (
     render_drawing_fragment,
     locate_drawing_fragments,
     extract_document_sheets,
-    normalize_code,
 )
 from obsidian import sync_document_card
 
