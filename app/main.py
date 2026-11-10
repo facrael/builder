@@ -824,8 +824,25 @@ async def execute_tool(name: str, args: dict, user_tg_id: int) -> dict:
 
 async def run_llm_agent(user_message: str, user_tg_id: int) -> str:
     """Executes multi-turn tool calling loop (max 6 iterations, 120s timeout) (З-9)."""
+    # Динамический блок: объекты, доступные ЭТОМУ пользователю (З-4: только свои).
+    user_projects = config.get_user_projects(user_tg_id)
+    projects_hint = ""
+    if user_projects:
+        proj_lines = []
+        for pcode in user_projects:
+            p = config.get_project(pcode)
+            proj_lines.append(f"- `{pcode}`{f' ({p.name})' if p and p.name else ''}")
+        projects_hint = (
+            "\n\n## Объекты текущего пользователя\n"
+            "Доступны только эти объекты (и только они):\n" + "\n".join(proj_lines) +
+            "\n\nЕсли в запросе упомянут один из этих объектов (по коду или названию, "
+            "в любом падеже и регистре — например «цтп», «теплосеть», «НС»), используй его "
+            "сразу, НЕ переспрашивая. Объект указывать в вызовах инструментов параметром "
+            "project_code именно этим кодом. Переспрашивай, только если объект понять "
+            "действительно невозможно."
+        )
     messages = [
-        {"role": "system", "content": AGENT_SYSTEM_PROMPT},
+        {"role": "system", "content": AGENT_SYSTEM_PROMPT + projects_hint},
         {"role": "user", "content": f"Вопрос пользователя (Telegram ID {user_tg_id}): {user_message}"}
     ]
 
