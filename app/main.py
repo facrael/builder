@@ -121,7 +121,11 @@ class SecurityAccessMiddleware(BaseMiddleware):
         if chat and chat.type != "private":
             return  # Silently ignore non-private chats (З-12)
 
+        # Update не имеет from_user — берём из вложенного события.
         user = getattr(event, "from_user", None)
+        if not user:
+            inner = getattr(event, "message", None) or getattr(event, "callback_query", None)
+            user = getattr(inner, "from_user", None) if inner else None
         if not user:
             return
 
