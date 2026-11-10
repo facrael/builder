@@ -1,70 +1,27 @@
-"""
-Скрипт первичной миграции и индексации 5 файлов комплектов РД в таблицу doc_sheets.
-Запуск внутри контейнера:
-  docker exec builder-bot-1 python seed_sheets.py
-Или локально при настроенном DATABASE_URL.
+"""Seed and index script for construction bot (ТЗ v2: З-5).
+
+Requirements:
+- No default hardcoded ADMIN_TG_ID. Fails if not set.
+- No sec_level in manifest.
+- Rejects ДСП files.
+- Indexes sheets into doc_sheets.
 """
 import asyncio
-import os
 import hashlib
+import os
+import sys
 from pathlib import Path
+from config import get_config
 from db import Database
-from pdf_engine import extract_document_sheets
+from pdf_engine import extract_document_sheets, detect_dsp_marker, extract_gost_stamp_info
 from obsidian import sync_document_card
-
-DOCS_MANIFEST = [
-    {
-        "filename": "Э1075_ДСП_ЦТП_КМ10.pdf",
-        "code": "ЦКДИ.2981.КМ10",
-        "project_code": "ЦТП",
-        "section": "КМ",
-        "doc_type": "РД",
-        "sec_level": "L1",
-        "revision": 1,
-    },
-    {
-        "filename": "Э756дспИ2.pdf",
-        "code": "ЦКДИ.2981.АР5",
-        "project_code": "ЦТП",
-        "section": "АР",
-        "doc_type": "РД",
-        "sec_level": "L0",
-        "revision": 2,
-    },
-    {
-        "filename": "Э795дсп.pdf",
-        "code": "ЦКДИ.2981.КЖ",
-        "project_code": "ЦТП",
-        "section": "КЖ",
-        "doc_type": "РД",
-        "sec_level": "L0",
-        "revision": 1,
-    },
-    {
-        "filename": "Э801дсп_КЖ7.pdf",
-        "code": "ЦКДИ.2981.КЖ7",
-        "project_code": "ЦТП",
-        "section": "КЖ",
-        "doc_type": "РД",
-        "sec_level": "L0",
-        "revision": 1,
-    },
-    {
-        "filename": "kns.pdf",
-        "code": "ЦКДИ.2981.АР3",
-        "project_code": "КНС",
-        "section": "АР",
-        "doc_type": "РД",
-        "sec_level": "L0",
-        "revision": 1,
-    },
-]
 
 POSSIBLE_DIRS = [
     Path("/data/files"),
     Path(__file__).resolve().parent.parent / "storage" / "files",
     Path(__file__).resolve().parent.parent,
 ]
+
 
 def find_file(filename: str) -> Path | None:
     for d in POSSIBLE_DIRS:
@@ -73,55 +30,87 @@ def find_file(filename: str) -> Path | None:
             return p
     return None
 
+
 async def seed():
+    raw_admin = os.getenv("ADMIN_TG_ID")
+    if not raw_admin or not raw_admin.strip():
+        print("❌ Ошибка: Переменная ADMIN_TG_ID обязательна для запуска seed_sheets.py", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        admin_tg_id = int(raw_admin.strip())
+        if admin_tg_id <= 0:
+            raise ValueError()
+    except ValueError:
+        print(f"❌ Ошибка: ADMIN_TG_ID должен быть положительным числом, получено '{raw_admin}'", file=sys.stderr)
+        sys.exit(1)
+
     db = Database()
     await db.connect()
     print("✅ Подключение к БД успешно.")
 
-    # Обеспечиваем админа
-    admin_id = int(os.getenv("ADMIN_TG_ID", "353745073"))
-    user = await db.ensure_whitelist_user(admin_id, "Главный Инженер (Admin)")
+    # Load configuration
+    try:
+        cfg = get_config()
+        await db.sync_config_with_db(cfg)
+        print("✅ Синхронизация .env с БД завершена.")
+    except Exception as e:
+        print(f"⚠️ Предупреждение при синхронизации конфигурации: {e}")
 
-    for item in DOCS_MANIFEST:
-        fpath = find_file(item["filename"])
+    # Files to index (if present in storage)
+    candidate_files = [
+        "Э1075_ДСП_ЦТП_КМ10_Площадки_и_опоры.pdf",
+        "Э756дспИ2.pdf",
+        "Э795дсп.pdf",
+        "Э801дсп_КЖ7.pdf",
+        "kns.pdf",
+    ]
+
+    for fname in candidate_files:
+        fpath = find_file(fname)
         if not fpath:
-            print(f"⚠️ Файл {item['filename']} не найден, пропускаем.")
+            continue
+
+        # Check DSP marker
+        if detect_dsp_marker(str(fpath), filename=fname):
+            print(f"🚫 Файл {fname} содержит маркер ДСП — пропуск согласно политике безопасности.")
             continue
 
         raw_bytes = fpath.read_bytes()
         sha256 = hashlib.sha256(raw_bytes).hexdigest()
 
-        # Регистрируем документ
+        stamp = extract_gost_stamp_info(str(fpath), filename=fname)
+        code = stamp.get("detected_code") or fpath.stem
+        section = stamp.get("detected_section") or "КЖ"
+        proj_code = stamp.get("suggested_project") or "ЦТП"
+
         saved_doc = await db.register_new_revision(
-            project_code=item["project_code"],
-            doc_type=item["doc_type"],
-            section=item["section"],
-            code=item["code"],
-            sec_level=item["sec_level"],
+            project_code=proj_code,
+            doc_type="РД",
+            section=section,
+            code=code,
+            stamp_change_no="0",
             file_path=str(fpath),
+            original_filename=fname,
             sha256=sha256,
-            user_id=user["id"]
+            uploader_tg_id=admin_tg_id,
         )
 
-        doc_id = saved_doc["id"]
-        print(f"📄 Документ зарегистрирован: ID {doc_id} | {item['code']} ({item['project_code']})")
+        if isinstance(saved_doc, dict) and saved_doc.get("duplicate"):
+            print(f"ℹ️ {fname} уже зарегистрирован (ID {saved_doc['id']}).")
+            doc_id = saved_doc["id"]
+        else:
+            print(f"✅ Зарегистрирован {fname} -> {code} (ID {saved_doc['id']})")
+            doc_id = saved_doc["id"]
+            sync_document_card(saved_doc)
 
-        # Извлекаем и индексируем листы в doc_sheets
-        sheets = extract_document_sheets(str(fpath), filename=item["filename"], cipher=item["code"])
+        sheets = extract_document_sheets(str(fpath), filename=fname, cipher=code)
         if sheets:
             await db.index_document_sheets(doc_id, sheets)
-            print(f"   📐 Проиндексировано листов: {len(sheets)}")
+            print(f"   Проиндексировано листов: {len(sheets)}")
 
-        # Синхронизируем карточку в Obsidian
-        card = sync_document_card(saved_doc)
-        print(f"   📝 Карточка Obsidian: {card}")
+    print("🏁 Завершено.")
 
-    # Проверка карты проекта
-    print("\n" + "=" * 60)
-    project_map = await db.get_project_sheets_map(user)
-    print(project_map)
-    print("=" * 60)
-    print("🎉 Миграция и индексация 5 файлов успешно завершена!")
 
 if __name__ == "__main__":
     asyncio.run(seed())

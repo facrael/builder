@@ -2,77 +2,84 @@ CREATE EXTENSION IF NOT EXISTS "pgcrypto";
 CREATE EXTENSION IF NOT EXISTS "pg_trgm";
 
 -- =====================================================
--- ПОЛЬЗОВАТЕЛИ
+-- ПОЛЬЗОВАТЕЛИ (ТЗ v2: без role и max_clearance)
 -- =====================================================
 
-CREATE TABLE users (
+CREATE TABLE IF NOT EXISTS users (
     id SERIAL PRIMARY KEY,
-    tg_id BIGINT UNIQUE NOT NULL,               -- Telegram user ID — основной идентификатор
+    tg_id BIGINT UNIQUE NOT NULL,
     full_name VARCHAR(255) NOT NULL,
-    phone VARCHAR(20),                           -- контактный телефон
-    position VARCHAR(255),                       -- должность: 'Главный инженер проекта'
-    role VARCHAR(50) NOT NULL,                   -- глобальная роль: 'admin','gip','pto','engineer','foreman','viewer'
-    max_clearance VARCHAR(10) NOT NULL DEFAULT 'L0',
+    phone VARCHAR(20),
+    position VARCHAR(255),
     is_active BOOLEAN DEFAULT TRUE,
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
-COMMENT ON COLUMN users.tg_id IS 'Telegram user ID — единственный внешний идентификатор сотрудника. Узнать: переслать сообщение @userinfobot';
+COMMENT ON COLUMN users.tg_id IS 'Telegram user ID — внешний идентификатор сотрудника';
 
 -- =====================================================
--- ОБЪЕКТЫ
+-- КАНАЛЫ И ИДЕНТИФИКАТОРЫ (З-20)
 -- =====================================================
 
-CREATE TABLE projects (
+CREATE TABLE IF NOT EXISTS identities (
     id SERIAL PRIMARY KEY,
-    code VARCHAR(50) UNIQUE NOT NULL,
-    name VARCHAR(255) NOT NULL
+    channel VARCHAR(32) NOT NULL DEFAULT 'telegram',
+    external_id VARCHAR(64) NOT NULL,
+    user_id INT REFERENCES users(id) ON DELETE CASCADE,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(channel, external_id)
 );
 
 -- =====================================================
--- ПРИВЯЗКА СОТРУДНИКОВ К ОБЪЕКТАМ (с ролью НА объекте)
+-- ОБЪЕКТЫ (ТЗ v2: cloud_ok на уровне объекта)
 -- =====================================================
 
-CREATE TABLE user_projects (
+CREATE TABLE IF NOT EXISTS projects (
+    id SERIAL PRIMARY KEY,
+    code VARCHAR(50) UNIQUE NOT NULL,
+    name VARCHAR(255) NOT NULL,
+    cloud_ok BOOLEAN DEFAULT FALSE,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- =====================================================
+-- ПРИВЯЗКА СОТРУДНИКОВ К ОБЪЕКТАМ (БЕЛЫЕ СПИСКИ)
+-- ТЗ v2: равные права у всех участников объекта
+-- =====================================================
+
+CREATE TABLE IF NOT EXISTS user_projects (
     user_id INT REFERENCES users(id) ON DELETE CASCADE,
     project_id INT REFERENCES projects(id) ON DELETE CASCADE,
-    project_role VARCHAR(50) NOT NULL DEFAULT 'viewer',   -- роль именно на ЭТОМ объекте
-    allowed_sections VARCHAR(50)[] DEFAULT '{}',           -- пустой = ВСЕ разделы
+    created_at TIMESTAMPTZ DEFAULT NOW(),
     PRIMARY KEY (user_id, project_id)
 );
 
-COMMENT ON COLUMN user_projects.allowed_sections IS 'Пустой массив {} = доступ ко всем разделам. Заполненный = только перечисленные, напр. {КР,АР}';
-
 -- =====================================================
 -- РЕЕСТР ДОКУМЕНТОВ (источник истины)
--- Ключевое правило: на каждую связку (project_id, code) может быть
--- ровно ОДНА запись со status='active'. Остальные — 'superseded'.
+-- ТЗ v2: без security_level; добавлен stamp_change_no,
+-- original_filename, статус quarantine
 -- =====================================================
 
-CREATE TABLE documents (
+CREATE TABLE IF NOT EXISTS documents (
     id SERIAL PRIMARY KEY,
     project_id INT REFERENCES projects(id),
     doc_type VARCHAR(50) NOT NULL,
     section VARCHAR(50) NOT NULL,
     code VARCHAR(150) NOT NULL,
+    stamp_change_no VARCHAR(20) DEFAULT '0',
     revision INT NOT NULL DEFAULT 1,
     status VARCHAR(50) NOT NULL DEFAULT 'active',
-    security_level VARCHAR(10) NOT NULL DEFAULT 'L0',
     file_path TEXT NOT NULL,
+    original_filename TEXT,
     sha256 VARCHAR(64) NOT NULL,
     uploaded_by INT REFERENCES users(id),
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
--- Быстрый поиск по (объект, тип, раздел, статус)
-CREATE INDEX idx_docs_lookup ON documents(project_id, doc_type, section, status);
-
--- Уникальный индекс: только ОДНА активная версия на каждый шифр внутри объекта
-CREATE UNIQUE INDEX idx_one_active_per_code
-    ON documents(project_id, code) WHERE status = 'active';
-
--- Защита от загрузки дубликатов (тот же файл)
-CREATE UNIQUE INDEX idx_docs_sha256 ON documents(sha256);
+CREATE INDEX IF NOT EXISTS idx_docs_lookup ON documents(project_id, doc_type, section, status);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_one_active_per_code ON documents(project_id, code) WHERE status = 'active';
+CREATE UNIQUE INDEX IF NOT EXISTS idx_docs_sha256_proj ON documents(project_id, sha256);
+CREATE INDEX IF NOT EXISTS idx_documents_code_trgm ON documents USING gin(code gin_trgm_ops);
 
 -- =====================================================
 -- ПОСТРАНИЧНЫЙ РЕЕСТР ЛИСТОВ ЧЕРТЕЖЕЙ (FTS + pg_trgm)
@@ -81,12 +88,13 @@ CREATE UNIQUE INDEX idx_docs_sha256 ON documents(sha256);
 CREATE TABLE IF NOT EXISTS doc_sheets (
     id SERIAL PRIMARY KEY,
     doc_id INT REFERENCES documents(id) ON DELETE CASCADE,
-    page_index INT NOT NULL,                  -- 0-based индекс страницы PDF (0, 1, 2...)
-    sheet_number INT,                         -- номер листа по ГОСТ (1, 2, 3...)
-    title TEXT NOT NULL,                      -- наименование листа из штампа/ведомости
-    tags TEXT[] DEFAULT '{}',                 -- теги ['опалубка', 'плита', 'фасад', 'кровля'...]
-    text_content TEXT DEFAULT '',             -- извлечённый текст листа
-    tsv tsvector,                             -- полнотекстовый индекс (russian)
+    page_index INT NOT NULL,
+    sheet_number INT,
+    title TEXT NOT NULL,
+    tags TEXT[] DEFAULT '{}',
+    text_content TEXT DEFAULT '',
+    codes TEXT[] DEFAULT '{}',
+    tsv tsvector,
     is_landscape BOOLEAN DEFAULT TRUE,
     created_at TIMESTAMPTZ DEFAULT NOW(),
     UNIQUE (doc_id, page_index)
@@ -95,40 +103,55 @@ CREATE TABLE IF NOT EXISTS doc_sheets (
 CREATE INDEX IF NOT EXISTS idx_doc_sheets_lookup ON doc_sheets(doc_id, page_index);
 CREATE INDEX IF NOT EXISTS idx_doc_sheets_tsv ON doc_sheets USING gin(tsv);
 CREATE INDEX IF NOT EXISTS idx_doc_sheets_title_trgm ON doc_sheets USING gin(title gin_trgm_ops);
-CREATE INDEX IF NOT EXISTS idx_documents_code_trgm ON documents USING gin(code gin_trgm_ops);
 
 -- =====================================================
--- ИНВАЙТ-КОДЫ (регистрация сотрудников)
+-- ЧЕРНОВИКИ ЗАГРУЗОК (pending_uploads)
 -- =====================================================
 
-CREATE TABLE invite_codes (
-    id SERIAL PRIMARY KEY,
-    code VARCHAR(20) UNIQUE NOT NULL,
-    target_role VARCHAR(50) NOT NULL DEFAULT 'viewer',
-    max_clearance VARCHAR(10) NOT NULL DEFAULT 'L0',
-    project_id INT REFERENCES projects(id),
-    allowed_sections VARCHAR(50)[] DEFAULT '{}',
-    created_by INT REFERENCES users(id),
-    used_by INT REFERENCES users(id),
-    expires_at TIMESTAMPTZ NOT NULL DEFAULT (NOW() + INTERVAL '48 hours'),
+CREATE TABLE IF NOT EXISTS pending_uploads (
+    file_id VARCHAR(100) PRIMARY KEY,
+    tg_id BIGINT NOT NULL,
+    project_code VARCHAR(50) NOT NULL,
+    doc_type VARCHAR(50) NOT NULL,
+    section VARCHAR(50) NOT NULL,
+    code VARCHAR(150) NOT NULL,
+    stamp_change_no VARCHAR(20) DEFAULT '0',
+    temp_path TEXT NOT NULL,
+    original_filename TEXT,
+    sha256 VARCHAR(64) NOT NULL,
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
 -- =====================================================
--- ЖУРНАЛ АУДИТА
+-- ЖУРНАЛ АУДИТА (Append-Only)
 -- =====================================================
 
-CREATE TABLE audit_log (
+CREATE TABLE IF NOT EXISTS audit_log (
     id BIGSERIAL PRIMARY KEY,
-    user_id INT REFERENCES users(id),
+    user_tg_id BIGINT,
     action VARCHAR(100) NOT NULL,
-    doc_id INT REFERENCES documents(id),
+    doc_id INT,
     details JSONB,
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
 -- =====================================================
--- ТЕСТОВЫЕ ДАННЫЕ
+-- МИГРАЦИИ СХЕМЫ
 -- =====================================================
 
-INSERT INTO projects (code, name) VALUES ('ОБЪЕКТ-1', 'ЖК Горизонт (Корпус 2)');
+CREATE TABLE IF NOT EXISTS schema_migrations (
+    version INT PRIMARY KEY,
+    name TEXT NOT NULL,
+    applied_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- =====================================================
+-- SQL ПРЕДСТАВЛЕНИЕ: ВИДИМЫЕ ДОКУМЕНТЫ (З-4)
+-- =====================================================
+
+CREATE OR REPLACE VIEW visible_documents AS
+SELECT d.*, p.code as project_code, p.name as project_name, p.cloud_ok as project_cloud_ok, up.user_id as allowed_user_id
+FROM documents d
+JOIN projects p ON d.project_id = p.id
+JOIN user_projects up ON p.id = up.project_id
+WHERE d.status != 'quarantine';
