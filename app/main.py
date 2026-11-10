@@ -727,7 +727,10 @@ TOOLS_SPEC = [
 ]
 
 
-async def execute_tool(name: str, args: dict, user_tg_id: int) -> dict:
+LAST_DELIVERY: dict[int, str] = {}  # chat_id -> подпись последней доставки (для финального текста)
+
+
+async def execute_tool(message: Message | None, name: str, args: dict, user_tg_id: int) -> dict:
     """Executes agent tools with strict user ACL checking (З-9)."""
     if name == "registry_lookup":
         p_code = args.get("project_code")
@@ -811,6 +814,26 @@ async def execute_tool(name: str, args: dict, user_tg_id: int) -> dict:
         if not doc or not await db.can_access(user_tg_id, doc["project_code"]):
             return {"status": "error", "message": "Документ недоступен."}
 
+        # РЕАЛЬНАЯ доставка листа (З-3): рендер + водяной знак + аудит + отправка.
+        if message is not None:
+            cap = f"Лист {p_idx + 1} — {doc.get('code', '')}"
+            if query:
+                cap += f" ({query})"
+            ok = await deliver_document_or_fragment(
+                message, user_tg_id, message.from_user.full_name,
+                dict(doc), page_index=int(p_idx), caption=cap,
+            )
+            if ok:
+                LAST_DELIVERY[message.chat.id] = cap
+                return {
+                    "status": "delivered",
+                    "doc_id": doc_id,
+                    "page_index": p_idx,
+                    "sheet": p_idx + 1,
+                    "message": f"Лист {p_idx+1} («{query}») отправлен пользователю фото. В финальном ответе кратко напиши, что на листе и его номер.",
+                }
+            return {"status": "error", "message": "Не удалось отправить изображение."}
+
         return {
             "status": "proposed",
             "doc_id": doc_id,
@@ -828,8 +851,8 @@ CHAT_HISTORY: dict[int, list[dict]] = {}
 HISTORY_MAX_MSGS = 8  # 4 пары «вопрос-ответ»
 
 
-async def run_llm_agent(user_message: str, user_tg_id: int, chat_id: int | None = None) -> str:
-    """Executes multi-turn tool calling loop (max 6 iterations, 120s timeout) (З-9)."""
+async def run_llm_agent(user_message: str, user_tg_id: int, chat_id: int | None = None, message: Message | None = None) -> str:
+    """Executes multi-turn tool calling loop (max 3 iterations, 120s timeout) (З-9)."""
     # Динамический блок: объекты, доступные ЭТОМУ пользователю (З-4: только свои).
     user_projects = config.get_user_projects(user_tg_id)
     projects_hint = ""
@@ -845,8 +868,18 @@ async def run_llm_agent(user_message: str, user_tg_id: int, chat_id: int | None 
             "в любом падеже и регистре — например «цтп», «теплосеть», «НС»), используй его "
             "сразу, НЕ переспрашивая. Объект указывать в вызовах инструментов параметром "
             "project_code именно этим кодом. Переспрашивай, только если объект понять "
-            "действительно невозможно."
+            "действительно невозможно.\n\nЕсли пользователь просит дать/показать лист, узел или чертёж («дай фундамент», «покажи план кровли») — СРАЗУ вызывай propose_crop для нужного листа (он сам отправляет фото пользователю) и не задавай вопросов о подтверждении и выборе: если подходящих листов несколько, выбери самый релевантный запросу сам и отправь его, упомянув остальные в ответе текстом. Финальный ответ делай коротким: что отправил и номер листа."
         )
+    # Карта листов сразу в контекст: экономит 1-2 хода tool-calling.
+    sheets_map = ""
+    try:
+        for pcode in (user_projects or []):
+            sm = await db.get_project_sheets_map(user_tg_id, pcode)
+            if sm:
+                sheets_map += f"\n\n## Карта листов комплекта по объекту {pcode}\n{sm}"
+    except Exception as map_err:
+        logger.warning(f"sheets_map preload failed: {map_err}")
+
     # Короткая память диалога: агент видит предыдущие вопросы и свои ответы,
     # поэтому «1» / «Схему опалубки плиты» после перечисления понимает как выбор.
     history = CHAT_HISTORY.get(chat_id, []) if chat_id else []
@@ -857,7 +890,7 @@ async def run_llm_agent(user_message: str, user_tg_id: int, chat_id: int | None 
         if history else ""
     )
     messages = [
-        {"role": "system", "content": AGENT_SYSTEM_PROMPT + projects_hint},
+        {"role": "system", "content": AGENT_SYSTEM_PROMPT + projects_hint + sheets_map},
     ] + history + [
         {"role": "user", "content": f"Вопрос пользователя (Telegram ID {user_tg_id}): {user_message}{history_note}"}
     ]
@@ -870,7 +903,7 @@ async def run_llm_agent(user_message: str, user_tg_id: int, chat_id: int | None 
     url = OPENROUTER_API_URL if use_openrouter else HERMES_API_URL
     model = OPENROUTER_MODEL if use_openrouter else HERMES_MODEL
 
-    for iteration in range(6):
+    for iteration in range(3):
         payload = {
             "model": model,
             "messages": messages,
@@ -891,7 +924,7 @@ async def run_llm_agent(user_message: str, user_tg_id: int, chat_id: int | None 
         tool_calls = msg.get("tool_calls")
         if not tool_calls:
             # Model finished answering
-            return msg.get("content") or "Ответ сформирован."
+            return msg.get("content") or (f"📄 Отправил выше: {LAST_DELIVERY.get(chat_id, 'лист')}. Что-то ещё?" if chat_id and chat_id in LAST_DELIVERY else "Документ не найден или недоступен по вашим правам.")
 
         # Execute tool calls
         for tc in tool_calls:
@@ -901,7 +934,7 @@ async def run_llm_agent(user_message: str, user_tg_id: int, chat_id: int | None 
             except Exception:
                 t_args = {}
 
-            t_result = await execute_tool(t_name, t_args, user_tg_id)
+            t_result = await execute_tool(message, t_name, t_args, user_tg_id)
             messages.append({
                 "role": "tool",
                 "tool_call_id": tc["id"],
@@ -928,7 +961,7 @@ async def handle_user_query(message: Message):
 
     try:
         chat_id = message.chat.id
-        reply = await run_llm_agent(text, tg_id, chat_id=chat_id)
+        reply = await run_llm_agent(text, tg_id, chat_id=chat_id, message=message)
         # Память диалога: сохраняем пару вопрос/ответ (только текст, без секретов).
         if chat_id:
             hist = CHAT_HISTORY.setdefault(chat_id, [])
