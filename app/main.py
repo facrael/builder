@@ -718,7 +718,12 @@ TOOLS_SPEC = [
                 "properties": {
                     "doc_id": {"type": "integer", "description": "ID документа"},
                     "page_index": {"type": "integer", "description": "Индекс страницы"},
-                    "query": {"type": "string", "description": "Название узла/разреза для вырезки"}
+                    "query": {"type": "string", "description": "Название узла/разреза для вырезки"},
+                    "clip_rect": {
+                        "type": "array",
+                        "items": {"type": "number"},
+                        "description": "НЕОБЯЗАТЕЛЬНО. Прямоугольник вырезки [x0, y0, x1, y1] в координатах PDF-точек этой страницы. Передавай ТОЛЬКО когда пользователь просит конкретный узел/фрагмент, а его положение на листе известно из текстового слоя листа (например, узел 3 в правой части листа). Без координат НЕ передавай — отправится весь лист."
+                    }
                 },
                 "required": ["doc_id", "page_index", "query"]
             }
@@ -810,6 +815,9 @@ async def execute_tool(message: Message | None, name: str, args: dict, user_tg_i
         doc_id = args.get("doc_id")
         p_idx = args.get("page_index", 0)
         query = args.get("query", "")
+        clip_rect = args.get("clip_rect") or None
+        if clip_rect and (not isinstance(clip_rect, list) or len(clip_rect) != 4):
+            clip_rect = None
 
         doc = await db.get_document_by_id(doc_id)
         if not doc or not await db.can_access(user_tg_id, doc["project_code"]):
@@ -817,18 +825,32 @@ async def execute_tool(message: Message | None, name: str, args: dict, user_tg_i
 
         # РЕАЛЬНАЯ доставка листа (З-3): рендер + водяной знак + аудит + отправка.
         if message is not None:
+            # Номер листа по штампу из doc_sheets (НЕ PDF-страница).
+            try:
+                rows = await db.pool.fetch(
+                    "SELECT sheet_number FROM doc_sheets WHERE doc_id=$1 AND page_index=$2",
+                    int(doc_id), int(p_idx),
+                )
+                sheet_no = rows[0]["sheet_number"] if rows else None
+            except Exception:
+                sheet_no = None
+
+            if sheet_no:
+                cap = f"Лист {sheet_no} — {doc.get('code', '')}"
+            else:
+                cap = f"Лист {p_idx + 1} — {doc.get('code', '')} (номер по штампу сверь)"
+            if query:
+                cap += f" ({query})"
+
             if int(p_idx) == LAST_SHEET_DELIVERED.get(message.chat.id, -1):
                 return {
                     "status": "already_sent",
                     "message": "Этот лист уже отправлен выше, повторно фото не отправляю. Ответь текстом на вопрос пользователя (например, перечисли, что есть по теме).",
                 }
             LAST_SHEET_DELIVERED[message.chat.id] = int(p_idx)
-            cap = f"Лист {p_idx + 1} — {doc.get('code', '')}"
-            if query:
-                cap += f" ({query})"
             ok = await deliver_document_or_fragment(
                 message, user_tg_id, message.from_user.full_name,
-                dict(doc), page_index=int(p_idx), caption=cap,
+                dict(doc), page_index=int(p_idx), clip_rect=clip_rect, caption=cap,
             )
             if ok:
                 LAST_DELIVERY[message.chat.id] = cap
